@@ -1,0 +1,49 @@
+{
+  "name": "qiflow-engine",
+  "version": "0.1.0",
+  "description": "AI 长文本创作确定性编排引擎：七阶段 DAG、四层约束网关、双轨质量门禁、章节监督修复闭环",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=23.11.1"
+  },
+  "scripts": {
+    "cut": "tsx scripts/cut-engine.mts",
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.35",
+    "@ai-sdk/deepseek": "^2.0.17",
+    "@ai-sdk/devtools": "^0.0.11",
+    "@ai-sdk/google": "^3.0.20",
+    "@ai-sdk/openai": "^3.0.25",
+    "@ai-sdk/openai-compatible": "^2.0.27",
+    "@ai-sdk/xai": "^3.0.47",
+    "@huggingface/transformers": "^3.8.1",
+    "@types/pg": "^8.20.4",
+    "ai": "^6.0.67",
+    "axios": "^1.13.2",
+    "form-data": "^4.0.5",
+    "ioredis": "^6.0.0",
+    "is-path-inside": "^4.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "knex": "^3.1.0",
+    "pg": "^8.16.0",
+    "qwen-ai-provider-v5": "^2.1.2",
+    "socket.io": "^4.8.1",
+    "sucrase": "^3.35.1",
+    "uuid": "^13.0.0",
+    "vercel-minimax-ai-provider": "^0.0.2",
+    "vm2": "^3.10.5",
+    "zhipu-ai-provider": "^0.2.2",
+    "zod": "^4.3.5"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.10"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "ignoreDeprecations": "5.0",
+    "target": "ESNext",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ESNext"],
+    "strict": true,
+    "noImplicitAny": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": false,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "typeRoots": ["./node_modules/@types", "./src/types"],
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.d.ts", "__tests__/**/*.ts"],
+  "exclude": ["node_modules"]
+}

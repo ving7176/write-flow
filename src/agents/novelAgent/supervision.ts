@@ -1,0 +1,368 @@
+/**
+ * 章节监督报告解析与红线判定（afterSubAgent 自动返工闭环用）。
+ *
+ * 监督 skill（novel_agent_supervision.md）输出 <supervisionReport>，issues 每条带类型标签：
+ * - [LOGIC]/[ABILITY]/[KNOWLEDGE]/[ERA]/[NUMERIC] → hard 红线（自动返工）
+ * - [OTHER] / 无标签 → 报告交人工（不自动返工）
+ *
+ * 报告是 LLM 自由输出，解析失败返回 null（调用方降级：不阻断、不返工）。
+ */
+
+import type { NumericViolation } from "@/pipeline/constraintChecker";
+import { verifyConstraintRefs } from "@/pipeline/constraintChecker";
+
+/** hard 红线类型（命中即触发自动重生成） */
+export const HARD_REDLINE_TYPES = new Set(["LOGIC", "ABILITY", "KNOWLEDGE", "ERA", "NUMERIC"]);
+
+/** 统一扫描器命中项结构（P0-1：代码扫描结果接入返工闭环） */
+export interface ScanIssue {
+  /** 标签：BANNED / REPEAT / APPROX / DESC / RATIO / WORD */
+  type: string;
+  text: string;
+  /** true=硬红线（HARD_REDLINE_TYPES 判定）；false=报告级（仅回灌提示，不强制重生成） */
+  hard: boolean;
+}
+
+/**
+ * 把扫描器命中项映射为监督 issue 列表，并标记是否触发返工（P0-1）。
+ * 红线规则（对齐 xianxia 校准与现有红线）：
+ *  - [BANNED]/[REPEAT]/[DESC]（描写>30%）→ 硬红线（文案附原文+行号，便于回灌）
+ *  - [APPROX]/[RATIO]/[WORD]（字数超 soft）→ 报告级，仅提示不返工
+ */
+export function mapScanIssuesToSupervision(scanIssues: ScanIssue[]): SupervisionIssue[] {
+  return scanIssues.map((s) => ({ type: s.type, text: s.text }));
+}
+
+/** 扫描器命中项中属于硬红线的（供 autoRepairChapter 并入 hardIssues） */
+export function hardScanIssues(scanIssues: ScanIssue[]): SupervisionIssue[] {
+  return scanIssues.filter((s) => s.hard).map((s) => ({ type: s.type, text: s.text }));
+}
+
+/** 自定义红线集合（新增 BANNED/REPEAT/DESC 为硬红线，仅扫描器路径用，不污染原有 5 类语义） */
+export function isScanHardTrace(issue: SupervisionIssue): boolean {
+  return HARD_REDLINE_TYPES.has(issue.type) || issue.type === "BANNED" || issue.type === "REPEAT" || issue.type === "DESC";
+}
+
+export interface SupervisionIssue {
+  /** 类型标签（LOGIC/ABILITY/KNOWLEDGE/ERA/NUMERIC/OTHER） */
+  type: string;
+  text: string;
+}
+
+export interface SupervisionReport {
+  grade: string;
+  summary: string;
+  issues: SupervisionIssue[];
+  maxRisk: string;
+  /** 批次2：可选结构化指标（<metrics> JSON 块：爽点数/钩子落地/字数偏差等，检查度量落表用） */
+  metrics?: Record<string, unknown>;
+}
+
+/** 解析 <metrics> JSON 块（批次2；可缺失——旧报告/未输出时返回 null） */
+export function parseMetricsBlock(raw: string): Record<string, unknown> | null {
+  const m = raw.match(/<metrics>([\s\S]*?)<\/metrics>/);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1].trim());
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 解析 <supervisionReport>：提取 grade/summary/maxRisk + issues（markdown 列表逐行解析，带类型标签）+ metrics。
+ * @returns 结构化报告；标签缺失或格式无法解析返回 null
+ */
+export function parseSupervisionReport(raw: string): SupervisionReport | null {
+  const m = raw.match(/<supervisionReport>([\s\S]*?)<\/supervisionReport>/);
+  if (!m) return null;
+  const body = m[1];
+  const grade = body.match(/<grade>([\s\S]*?)<\/grade>/)?.[1]?.trim() ?? "";
+  const summary = body.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim() ?? "";
+  const maxRisk = body.match(/<maxRisk>([\s\S]*?)<\/maxRisk>/)?.[1]?.trim() ?? "";
+  // issues 为 markdown 列表：`- [TYPE] 问题描述（引用位置）`，逐行解析（<issues> 块内）
+  const issuesBlock = body.match(/<issues>([\s\S]*?)<\/issues>/)?.[1] ?? "";
+  const issues: SupervisionIssue[] = [];
+  for (const line of issuesBlock.split("\n")) {
+    const im = line.match(/-\s*\[([A-Z]+)\]\s*(.+)/);
+    if (im) issues.push({ type: im[1], text: im[2].trim() });
+  }
+  return { grade, summary, issues, maxRisk, metrics: parseMetricsBlock(body) ?? undefined };
+}
+
+/** hard 红线判定（命中类型集合即自动返工） */
+export function isHardRedline(issue: SupervisionIssue): boolean {
+  return HARD_REDLINE_TYPES.has(issue.type);
+}
+
+// ── 章节返工择优（P1a：返工稿劣化即止损，防「B 级初稿被 D 级返工稿覆盖」）──
+
+/** 监督评级 → 质量分（A=4/B=3/C=2/D=1；未知/缺失=0 视为最差，不采用） */
+const GRADE_RANK: Record<string, number> = { A: 4, B: 3, C: 2, D: 1 };
+
+export function gradeRankOf(grade: string): number {
+  const g = (grade ?? "").trim().toUpperCase();
+  return GRADE_RANK[g] ?? 0;
+}
+
+/** 稿质量对比：评级高者优；评级相同 hard 红线数少者优。返回 >0=a 更优，<0=a 更差，0=平 */
+export function compareQuality(a: { rank: number; hardCount: number }, b: { rank: number; hardCount: number }): number {
+  if (a.rank !== b.rank) return a.rank - b.rank;
+  return b.hardCount - a.hardCount;
+}
+
+// ── 跨章监督触发（P2 三层架构）与 5 章语义（纯函数，可单测） ──
+
+/**
+ * 层2 中期核查触发判定（每 5 章，状态机固定间隔）：
+ * 用 lastMidterm+5 而非 chapterNo%5==0——删章/重写后也能正确推进，不会卡在倍数。
+ */
+export function midtermDue(chapterNo: number, lastMidterm: number): boolean {
+  return chapterNo >= lastMidterm + 5;
+}
+
+/** 层3 里程碑终审触发判定（每 10 章，同上状态机语义） */
+export function milestoneDue(chapterNo: number, lastMilestone: number): boolean {
+  return chapterNo >= lastMilestone + 10;
+}
+
+/**
+ * 解析单次对话目标章数（5 章语义修正）：从用户消息提取「写/生成/续写 N 章」，
+ * clamp 到 1~5；未匹配返回 1（单章）。按钮路径 text 为空 → 1。
+ */
+export function parseChapterTarget(text: string | undefined): number {
+  const m = (text ?? "").match(/(?:写|生成|续写|连写|要)\s*(\d+)\s*章/);
+  if (!m) return 1;
+  const raw = Number(m[1]);
+  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 1, 5));
+}
+
+// ── 章节自动修复闭环（afterSubAgent 调用，抽离为纯函数便于单测） ──
+
+export interface RepairChapterInput {
+  reel?: string;
+  chapter?: string;
+  content?: string;
+}
+
+/** 修复闭环依赖的最小工具接口（stageTools 的鸭子类型，测试可 mock；ai SDK Tool.execute 返回类型宽，用 unknown 收敛） */
+export interface RepairStageTools {
+  run_sub_agent_supervision: {
+    execute?: (input: { prompt: string }, opts: unknown) => unknown;
+  };
+  chapter: {
+    execute?: (input: { prompt: string }, opts: unknown) => unknown;
+  };
+}
+
+export interface RepairResult {
+  raw: string;
+  parsed: unknown;
+  /** 实际重生成次数（0=首稿即通过） */
+  attempts: number;
+  /** 最终是否通过红线审核（false=重试耗尽落库交人工） */
+  passed: boolean;
+  /** 最优稿监督评级（P1c 章节质量门禁：C/D 时 full 模式强制停交人工） */
+  grade?: string;
+}
+
+/** 从工具返回值提取 raw 字符串（ai SDK execute 返回 {raw, parsed?, error?} 或 string 或流，只认对象形态的 raw） */
+function extractRaw(resp: unknown): string {
+  if (resp && typeof resp === "object" && !Array.isArray(resp)) {
+    const raw = (resp as Record<string, unknown>).raw;
+    if (typeof raw === "string") return raw;
+  }
+  return "";
+}
+
+/** 从工具返回值提取字段（对象形态窄化） */
+function extractField(resp: unknown, field: string): unknown {
+  if (resp && typeof resp === "object" && !Array.isArray(resp)) {
+    return (resp as Record<string, unknown>)[field];
+  }
+  return undefined;
+}
+
+/** 构造监督审核 prompt（当前稿正文，截断 3000 字） */
+export function buildSupervisionPrompt(current: RepairChapterInput): string {
+  return `请审核刚生成的章节：\n卷：${current.reel ?? ""}\n章名：${current.chapter ?? ""}\n正文：\n${(current.content ?? "").slice(0, 3000)}\n\n请按审核规范输出审核报告。`;
+}
+
+/** 构造重生成 prompt（约束回灌：违反的约束 + 证据；措辞用「交代来源」而非「改写情节」，避免为自洽写僵硬） */
+/** 章节目标字数下限（与 createChapterScanProvider 缺省 wordMin=2850 同源；告警文案用） */
+const WORD_TARGET = 2850;
+
+/** D 试点：hard 问题分类修正策略——整章重写是返工稿稳定劣化的根因（E2E 实测 B→D/B→C），
+ *  改为「保留未涉内容、只定点修问题段」；best 择优仍兜底（劣化稿不落库，试点安全） */
+const REPAIR_STRATEGY: Record<string, string> = {  BANNED: "替换违禁表述为合规同义表达，保持句式与段落结构不变",
+  ERA: "若该现代词属穿越者合法持有（约束已声明穿越设定）则保留并补一句交代来源；否则替换为世界观内的等价表达",
+  REPEAT: "保留其中一处重复句，其余改写为同义表达，维持上下文连贯",
+  DESC: "压缩静态写景/冗余描写至符合红线（连续写景>120字拆散或删减），保留动作与对话推进",
+  WORD: "若超量则删减冗余段落至目标字数；若字数不足则在现有内容基础上扩写补足（展开场景、细化对话与动作），不重写已写好的部分",
+  NUMERIC: "修正与账本/约束冲突的数值条目，保留其余内容",
+  LOGIC: "修复该处逻辑断点（衔接/因果/来源），保留其余情节",
+  OTHER: "针对问题定点修改，未涉及内容原样保留",
+};
+
+export function buildRepairPrompt(current: RepairChapterInput, hardIssues: SupervisionIssue[]): string {
+  const byType = new Map<string, SupervisionIssue[]>();
+  for (const i of hardIssues) byType.set(i.type, [...(byType.get(i.type) ?? []), i]);
+  const guidance = [...byType.entries()].map(
+    ([type, items]) =>
+      `### ${type}（${items.length} 处）\n${items.map((i) => `- [${type}] ${i.text}`).join("\n")}\n修正方式：${REPAIR_STRATEGY[type] ?? REPAIR_STRATEGY.OTHER}`,
+  );
+  const wordHint = byType.has("WORD") ? `- 存在字数问题：修正稿正文字数**必须达到约 ${WORD_TARGET} 字**（不含标点空行的正文主体），交付前自行清点` : "";
+  return [
+    `你上一稿章节存在以下问题，请**定点修正**（不是整章重写）：`,
+    "",
+    ...guidance,
+    "",
+    "定点修正要求：",
+    "- **原样保留所有未涉及问题的段落、对话与叙事**——它们没有错，整章重写反而引入新问题（此前实测返工稿常劣化于原稿）",
+    "- 仅针对问题段做最小改动：替换违禁表述、压缩冗余描写、修正数值/逻辑、补足或删减字数",
+    wordHint,
+    "- 问题涉及金钱/物品/能力/知识来源时，必须交代合理的获取或习得途径，严禁凭空获得",
+    "- 必须遵守本书已确立的硬约束（见工作区数据），修复后不得引入新的矛盾",
+    "- 输出**完整章节全文**（不是补丁），篇幅与原文相近",
+  ].filter(Boolean).join("\n");
+}
+
+/**
+ * 章节自动修复闭环：监督审核 → hard 红线判定 → 重生成（约束回灌）→ 再审，上限 maxRetries 次。
+ * 返工发生在落库之前（afterSubAgent 在 persistStage 前执行），调用方拿到覆盖稿后最终落库修复版。
+ *
+ * 2B 扩展：numericViolations（代码数值断言命中）并入 hard 红线触发返工（U1 双层兜底：
+ * 硬冲突强制返工，耗尽走 passed=false 落最优稿交人工）；knownConstraintIds 做监督报告
+ * 约束 id 回查（引用未知约束标记可疑，不阻断）。
+ *
+ * 2D 扩展：onDegrade 回调——监督异常/报告解析失败/返工耗尽等「质量降级」场景显式上报
+ * （不再静默 console.warn），调用方据此 socket 推前端标红 + 落 trace。
+ *
+ * @returns 修复后的覆盖稿（返工发生过）；无需修复/重试耗尽/监督降级返回 null（调用方保持原稿）
+ */
+export async function autoRepairChapter(
+  stageTools: RepairStageTools,
+  chapter: RepairChapterInput,
+  raw: string,
+  maxRetries = 2,
+  numericViolations: NumericViolation[] = [],
+  knownConstraintIds?: Set<string>,
+  onDegrade?: (reason: string) => void,
+  onReport?: (report: SupervisionReport, reportRaw: string) => void,
+  scanProvider?: (content: string) => ScanIssue[],
+  /** 观察项2修复：与系统事实矛盾的 LLM hard 类型抑制（worldEra=modern 时抑制 LLM 的 [ERA]——
+   *  代码扫描是 era 权威判定源，LLM 偶发判不稳定浪费返工次数）；报告级仍展示 */
+  suppressLlmTypes?: string[],
+): Promise<RepairResult | null> {
+  let current: RepairChapterInput = { ...chapter };
+  let currentRaw = raw;
+  let attempts = 0;
+  // P1a 择优：已审核稿中的最优稿（首稿必入 best；返工稿不比 best 优时立即止损返回 best，
+  // 杜绝「B 级初稿被 D 级返工稿覆盖落库」——本次一键生成实测的返工劣化场景）
+  let best: { raw: string; parsed: unknown; rank: number; hardCount: number; grade: string } | null = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // 1. 监督审核当前稿
+    let report: SupervisionReport | null = null;
+    let reportRaw = "";
+    try {
+      const supResp = await stageTools.run_sub_agent_supervision.execute?.(
+        { prompt: buildSupervisionPrompt(current) },
+        { toolCallId: "stage-chapter-supervision", messages: [] },
+      );
+      reportRaw = extractRaw(supResp);
+      report = parseSupervisionReport(reportRaw);
+    } catch (e) {
+      // 监督失败不阻断落库（沿用现有降级语义），2D：显式上报降级
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn("[novelAgent] 章节监督审核失败（不阻断落库）:", msg);
+      onDegrade?.(`监督审核异常: ${msg}`);
+      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+    }
+    if (!report) {
+      // 报告解析失败：降级不返工，2D：显式上报降级
+      onDegrade?.("监督报告解析失败（未产出 <supervisionReport>）");
+      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+    }
+    // 批次2：每次审核报告透出（调用方落 o_check_report——人工写作章节检查/报告中心的章节监督数据源）
+    onReport?.(report, reportRaw);
+    // 2B 约束 id 回查：issue 引用的约束 id 必须存在于已知清单，未知 id 标记可疑（不阻断）
+    if (knownConstraintIds && knownConstraintIds.size > 0) {
+      const suspicious = verifyConstraintRefs(report.issues, knownConstraintIds);
+      if (suspicious.length) console.warn(`[novelAgent] 监督报告引用未知约束 id: ${suspicious.join(",")}（标记可疑，不阻断）`);
+    }
+    // 2. hard 红线判定（命中 LOGIC/NUMERIC/ABILITY/KNOWLEDGE/ERA 类型即自动返工；
+    //    2B：代码数值断言命中并入，作为硬冲突强制返工——U1 兜底）
+    //    观察项2：suppressLlmTypes 命中的 LLM hard 降为报告级（系统性事实优先，代码扫描为 era 权威源）
+    const llmHardIssues = report.issues.filter((i) => isHardRedline(i) && !(suppressLlmTypes?.includes(i.type)));
+    const suppressedLlmHard = report.issues.filter((i) => isHardRedline(i) && !!suppressLlmTypes?.includes(i.type));
+    if (suppressedLlmHard.length) {
+      console.warn(`[novelAgent] 监督 [${suppressedLlmHard.map((i) => i.type).join("/")}] 与系统判定矛盾，降报告级不返工`);
+    }
+    const numericIssues: SupervisionIssue[] = numericViolations.map((v) => ({
+      type: "NUMERIC",
+      text: `[数值断言] ${v.statement}（${v.field} 实际=${v.actual}，约束须 ${v.op} ${v.expected}）`,
+    }));
+    // P0-1：代码扫描（当轮稿重扫，保证重生成后也已扫描）；硬红线（BANNED/REPEAT/DESC）并入触发返工，
+    // 报告级（APPROX/RATIO/WORD）不强制返工。扫描失败（provider 抛错）降级为空，不阻断。
+    let scanHardIssues: SupervisionIssue[] = [];
+    if (scanProvider) {
+      try {
+        const scan = scanProvider(current.content ?? "");
+        scanHardIssues = scan.filter((s) => s.hard).map((s) => ({ type: s.type, text: s.text }));
+      } catch (e) {
+        console.warn("[novelAgent] 章节代码扫描失败（降级不阻断）:", e instanceof Error ? e.message : String(e));
+      }
+    }
+    const hardIssues = [...llmHardIssues, ...numericIssues, ...scanHardIssues];
+    // 观察项1：字数远低标记（止损/耗尽落库时显式告警，不再静默残留半截章）
+    const wordShortfall = hardIssues.some((i) => i.type === "WORD" && i.text.includes("远低于目标下限"));
+    // P1a 择优：当前稿质量 vs 已审最优稿（首稿直接入 best）
+    const rank = gradeRankOf(report.grade);
+    const curQuality = { rank, hardCount: hardIssues.length };
+    if (!best || compareQuality(curQuality, best) >= 0) {
+      best = { raw: currentRaw, parsed: current, rank, hardCount: hardIssues.length, grade: report.grade };
+    } else {
+      // 返工稿劣化 → 立即止损返回最优稿（不再烧下一次返工）
+      console.warn(`[novelAgent] 章节自动修复稿质量劣化（${best.grade}→${report.grade}），保留更优稿交人工（红线：${hardIssues.map((i) => i.type).join("/")}）`);
+      const shortfallNote = (best as { hasWordShortfall?: boolean }).hasWordShortfall
+        ? `；注意：保留稿字数未达标（远低于 ${WORD_TARGET}），建议人工续写补足或重做本章`
+        : "";
+      onDegrade?.(`返工稿质量劣化（${best.grade}→${report.grade}），保留更优稿交人工复核${shortfallNote}`);
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+    }
+    if (typeof best === "object" && best) (best as { hasWordShortfall?: boolean }).hasWordShortfall = wordShortfall;
+    if (hardIssues.length === 0) return attempts > 0 ? { raw: currentRaw, parsed: current, attempts, passed: true, grade: best?.grade } : null; // 通过 → 保持当前稿
+    if (attempt >= maxRetries) {
+      console.warn(`[novelAgent] 章节自动修复 ${maxRetries} 次仍未通过红线审核，落库最优稿交人工（红线：${hardIssues.map((i) => i.type).join("/")}）`);
+      const shortfallNote = wordShortfall || (best as { hasWordShortfall?: boolean }).hasWordShortfall
+        ? `；注意：字数未达标（远低于 ${WORD_TARGET}），已保留评级更优稿，建议人工续写补足`
+        : "";
+      onDegrade?.(`返工 ${maxRetries} 次耗尽仍不过红线（${hardIssues.map((i) => i.type).join("/")}），落库最优稿交人工复核${shortfallNote}`);
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+    }
+    // 3. 重生成（约束回灌）
+    try {
+      const regenResp = await stageTools.chapter.execute?.(
+        { prompt: buildRepairPrompt(current, hardIssues) },
+        { toolCallId: `stage-chapter-regen-${attempt}`, messages: [] },
+      );
+      const regenParsed = extractField(regenResp, "parsed");
+      if (regenParsed) {
+        current = { ...(regenParsed as RepairChapterInput) };
+        const regenRaw = extractRaw(regenResp);
+        if (regenRaw) currentRaw = regenRaw;
+        attempts++;
+        continue; // 回监督再审
+      }
+      console.warn("[novelAgent] 章节自动修复重生成产物无效，落库最优稿:", String(extractField(regenResp, "error") ?? "无 error"));
+      onDegrade?.("重生成产物无效（无 parsed），落库最优稿交人工复核");
+      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+    } catch (e) {
+      console.warn("[novelAgent] 章节自动修复失败（不阻断落库）:", e instanceof Error ? e.message : String(e));
+      onDegrade?.(`章节自动修复异常: ${e instanceof Error ? e.message : String(e)}`);
+      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+    }
+  }
+  return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+}
