@@ -9,6 +9,7 @@
   },
   "scripts": {
     "cut": "tsx scripts/cut-engine.mts",
+    "sync": "tsx scripts/sync-engine.mts",
     "lint": "tsc --noEmit",
     "test": "vitest run"
   },
