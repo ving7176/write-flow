@@ -145,7 +145,23 @@ function main(): void {
       skills++;
     }
   }
-  console.log(`cut complete: ${copied} files + ${Object.keys(OVERRIDES).length} overrides + ${skills} skills -> ${path.relative(process.cwd(), OUT)}`);
+  // 建表 SQL 随包（README 部署文档引用包内路径，主仓副本不出仓）
+  const outSqlDir = path.join(OUT, "sql");
+  fs.mkdirSync(outSqlDir, { recursive: true });
+  fs.copyFileSync(path.join(APP_ROOT, "sql/schema.sql"), path.join(outSqlDir, "schema.sql"));
+  // 供应商适配代码随包（getCode 运行时按 cwd/data/vendor/<id>.ts 读取）；toonflow/comfyui 已退役，不随包
+  const vendorDir = path.join(APP_ROOT, "data/vendor");
+  const outVendorDir = path.join(OUT, "data/vendor");
+  fs.rmSync(outVendorDir, { recursive: true, force: true });
+  fs.mkdirSync(outVendorDir, { recursive: true });
+  let vendors = 0;
+  for (const f of fs.readdirSync(vendorDir)) {
+    if (f.endsWith(".ts") && !f.startsWith("toonflow") && !f.startsWith("comfyui")) {
+      fs.copyFileSync(path.join(vendorDir, f), path.join(outVendorDir, f));
+      vendors++;
+    }
+  }
+  console.log(`cut complete: ${copied} files + ${Object.keys(OVERRIDES).length} overrides + ${skills} skills + ${vendors} vendors + schema.sql -> ${path.relative(process.cwd(), OUT)}`);
 }
 
 main();

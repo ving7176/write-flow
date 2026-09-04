@@ -17,33 +17,13 @@
 import { execSync } from "child_process";
 import path from "path";
 import { pathToFileURL } from "url";
+import { buildCommitMessage, collectPushUrls, isClean, parseLsRemote } from "./sync-engine-lib";
 
 const HERE = import.meta.dirname ?? ".";
 const ENGINE_ROOT = path.resolve(HERE, "..");
 const MAIN_REPO = path.resolve(HERE, "../../..");
 /** cut 的全部写入路径（变更检测与失败还原的范围） */
-const CUT_PATHS = "src data/skills";
-
-// —— 纯函数（导出供单测） ——
-
-export function isClean(statusPorcelain: string): boolean {
-  return statusPorcelain.trim() === "";
-}
-
-/** 推送目标 = fetch 主源 + 全部 pushurl（去重保序）：Gitee 无 pushurl 配置，漏掉 fetch 源 = 漏推主站 */
-export function collectPushUrls(fetchUrl: string, pushUrls: string[]): string[] {
-  return [...new Set([fetchUrl, ...pushUrls])];
-}
-
-export function buildCommitMessage(mainShortHash: string): string {
-  return `sync: 同步主仓 ${mainShortHash} 的引擎闭包变更（cut + lint + test 通过）`;
-}
-
-/** git ls-remote 输出取 main 分支 hash：`<hash>\trefs/heads/main`；无则 null */
-export function parseLsRemote(output: string): string | null {
-  const line = output.split("\n").find((l) => l.trim().endsWith("refs/heads/main"));
-  return line ? line.split("\t")[0].trim() : null;
-}
+const CUT_PATHS = "src data/skills sql";
 
 // —— 编排 ——
 

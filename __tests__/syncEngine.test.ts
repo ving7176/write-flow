@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCommitMessage, collectPushUrls, isClean, parseLsRemote } from "../scripts/sync-engine.mts";
+import { buildCommitMessage, collectPushUrls, isClean, parseLsRemote } from "../scripts/sync-engine-lib";
 
 describe("sync-engine 纯函数", () => {
   it("isClean：空/纯空白输出视为干净，任何条目视为脏", () => {
