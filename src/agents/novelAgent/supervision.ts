@@ -127,15 +127,18 @@ export function milestoneDue(chapterNo: number, lastMilestone: number): boolean 
   return chapterNo >= lastMilestone + 10;
 }
 
+/** 单次连写上限：放开到 10 章（对齐 xianxia 一句话写 10 章；chat 入口按目标联动 aiCallBudget） */
+export const CHAPTER_TARGET_MAX = 10;
+
 /**
- * 解析单次对话目标章数（5 章语义修正）：从用户消息提取「写/生成/续写 N 章」，
- * clamp 到 1~5；未匹配返回 1（单章）。按钮路径 text 为空 → 1。
+ * 解析单次对话目标章数：从用户消息提取「写/生成/续写 N 章」，
+ * clamp 到 1~10；未匹配返回 1（单章）。按钮路径 text 为空 → 1。
  */
 export function parseChapterTarget(text: string | undefined): number {
   const m = (text ?? "").match(/(?:写|生成|续写|连写|要)\s*(\d+)\s*章/);
   if (!m) return 1;
   const raw = Number(m[1]);
-  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 1, 5));
+  return Math.max(1, Math.min(Number.isFinite(raw) ? raw : 1, CHAPTER_TARGET_MAX));
 }
 
 // ── 章节自动修复闭环（afterSubAgent 调用，抽离为纯函数便于单测） ──

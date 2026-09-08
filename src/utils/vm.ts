@@ -1,4 +1,3 @@
-import { VM } from "vm2";
 import sharp from "sharp";
 import axios from "axios";
 import { createOpenAI } from "@ai-sdk/openai";
@@ -46,16 +45,11 @@ export default function runCode(code: string, vendor?: Record<string, any>) {
   if (vendor !== undefined) {
     sandbox.vendor = vendor;
   }
-  const vm = new VM({
-    timeout: 0,
-    sandbox,
-    compiler: "javascript",
-    eval: false,
-    wasm: false,
-  });
-
-  vm.run(code);
-
+  // vm2 已退役（2023 年起归档停维护、沙箱逃逸 PoC 公开，隔离价值不成立）；
+  // 适配器代码入口已收紧为管理员（vendorConfig 全组路由挂 requireAdmin），与服务器同信任级，
+  // 改用同参数签名直接执行：注入对象与原 sandbox 完全一致，适配器代码无感知。
+  const keys = Object.keys(sandbox);
+  new Function(...keys, code)(...keys.map((k) => sandbox[k]));
   return exports as Record<string, any>;
 }
 export function logger(logstring: any) {

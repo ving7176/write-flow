@@ -49,7 +49,7 @@ export const NOVEL_STAGES: NovelStageDef[] = [
   { stageKey: "characters", name: "人物设定", dependsOn: ["world", "briefConfirmed"], preloadKeys: ["characters", "world", "brief", "answers"], supervision: "novel_stage_check_characters.md" },
   { stageKey: "synopsis", name: "简介", dependsOn: ["world", "characters"], preloadKeys: ["world", "characters", "cheat", "brief", "answers"], supervision: "novel_stage_check_synopsis.md" },
   { stageKey: "outline", name: "大纲", dependsOn: ["synopsis"], preloadKeys: ["synopsis", "characters", "world", "cheat", "backstoryEvents", "brief", "answers", "volumePlan"], supervision: "novel_stage_check_outline.md" },
-  { stageKey: "chapter", name: "章节", dependsOn: ["outline"], preloadKeys: ["outline", "synopsis", "world", "characters", "cheat", "backstoryEvents", "subplots", "chapters", "entityFocus"], chapter: true, isLast: true },
+  { stageKey: "chapter", name: "章节", dependsOn: ["outline"], preloadKeys: ["outline", "synopsis", "world", "characters", "cheat", "backstoryEvents", "subplots", "chapters", "entityFocus", "styleGuide"], chapter: true, isLast: true },
 ];
 
 /**
