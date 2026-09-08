@@ -145,6 +145,7 @@ __tests__/               # 行为等价测试（82 例，与主仓同套断言�
 examples/                # 零依赖状态机推演 + 真库真模型终端流水线
 scripts/cut-engine.mts   # 切割重建工具（维护者用）
 scripts/sync-engine.mts  # 主仓→双站一条命令同步（维护者用）
+scripts/sync-sentinel.mts # 双站漂移巡检：站点 hash 一致性 + 闭包未同步检测（维护者用）
 ```
 
 ## 开发
@@ -154,6 +155,7 @@ yarn test     # vitest 全量（无需 DB，mock 注入）
 yarn lint     # tsc --noEmit
 yarn cut      # 源码由宿主仓库切割生成，本包不手工编辑 src/（维护者）
 yarn sync     # 主仓变更 → 切割 → 门禁 → 提交推送双站（维护者）
+yarn sentinel # 巡检双站 hash 一致性与闭包漂移，--notify 附 macOS 本地通知（维护者）
 ```
 
 ## License
