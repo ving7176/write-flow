@@ -18,11 +18,15 @@ export interface BannedWordRule {
   kind: "poison" | "density";
   /** density 类的每章允许次数（≤该值不报）/ 频率上限（>= 该值触发） */
   threshold?: number;
+  /** density 组名：同组词共享配额，按每千字频率判超（如弱化副词组，rate 取 perKilo） */
+  group?: string;
+  /** density 组的每千字允许次数（组内任一规则携带即可） */
+  perKilo?: number;
 }
 
 export interface BannedScanIssue {
-  /** 类型标签：[BANNED]=零容忍 | [RATIO]=频次超限（报告级，非红线） */
-  type: "BANNED" | "RATIO";
+  /** 类型标签：[BANNED]=零容忍 | [RATIO]=频次超限（报告级，非红线） | [SLOP]=AI味句式（hard/soft 由 kind 区分） */
+  type: "BANNED" | "RATIO" | "SLOP";
   word: string;
   kind: "poison" | "density";
   /** 命中位置（首个命中片段，附上下文方便定位） */
@@ -82,6 +86,14 @@ function makeSnippet(text: string, idx: number, len: number): string {
   return text.slice(start, end);
 }
 
+/** 白名单豁免判断（story-deslop 书级白名单机制）：命中位置 ±8 字窗口内含白名单字面片段则跳过该次计数。
+ *  用途：世界观术语包含禁用子串时不误报（如禁「一抹」而书中有专有名词「一抹斜阳」）。 */
+function hitWhitelisted(text: string, idx: number, len: number, whitelist: readonly string[]): boolean {
+  if (!whitelist.length) return false;
+  const window = text.slice(Math.max(0, idx - 8), Math.min(text.length, idx + len + 8));
+  return whitelist.some((w) => typeof w === "string" && w && window.includes(w));
+}
+
 /** 定位命中处的行号（首个命中） */
 export function locateLine(text: string, idx: number): number {
   let line = 1;
@@ -136,30 +148,52 @@ export function mergeConstraintRules(
  *
  * @param text 正文章节文本（frontmatter 已在外部剥除）
  * @param ruleSet 词表（Map）。缺省用默认内置表
+ * @param whitelist 白名单字面片段（命中位置附近含片段则豁免，防世界观术语误报）
  * @returns 问题列表；零命中返回 []
  *
  * 语义：
  * - poison 类：每命中一次报一条 [BANNED]
- * - density 类：统计全章次数，>= threshold 报一条 [RATIO]（附 count）；低于 threshold 不报
+ * - density 类（带 group）：组内词共享每千字配额，合计频率 >= perKilo 报一条 [RATIO]（word=「组名(组)」）
+ * - density 类（无 group）：统计全章次数，>= threshold 报一条 [RATIO]（附 count）；低于 threshold 不报
  */
-export function scanBannedWords(text: string, ruleSet?: Map<string, BannedWordRule>): BannedScanIssue[] {
+export function scanBannedWords(
+  text: string,
+  ruleSet?: Map<string, BannedWordRule>,
+  whitelist: readonly string[] = [],
+): BannedScanIssue[] {
   const rules = ruleSet ?? buildRuleSet(DEFAULT_BANNED_WORDS);
   const issues: BannedScanIssue[] = [];
   const densitySeen = new Set<string>();
+  // 组限频聚合（弱化副词类共享配额）：组名 → {合计次数, 每千字允许数, 首个命中位置}
+  const groupAgg = new Map<string, { count: number; perKilo: number; firstIdx: number; firstLen: number }>();
 
   for (const [word, rule] of rules) {
     if (rule.kind === "poison") {
       let idx = text.indexOf(word);
       while (idx !== -1) {
-        issues.push({
-          type: "BANNED",
-          word,
-          kind: "poison",
-          snippet: makeSnippet(text, idx, word.length),
-          count: 1,
-          line: locateLine(text, idx),
-        });
+        if (!hitWhitelisted(text, idx, word.length, whitelist)) {
+          issues.push({
+            type: "BANNED",
+            word,
+            kind: "poison",
+            snippet: makeSnippet(text, idx, word.length),
+            count: 1,
+            line: locateLine(text, idx),
+          });
+        }
         idx = text.indexOf(word, idx + word.length);
+      }
+    } else if (rule.group) {
+      // 组限频：只累计，循环外统一按每千字频率判定
+      const count = countOccurrences(text, word);
+      if (count > 0) {
+        const firstIdx = text.indexOf(word);
+        const agg = groupAgg.get(rule.group);
+        if (agg) {
+          agg.count += count;
+        } else {
+          groupAgg.set(rule.group, { count, perKilo: rule.perKilo ?? 3, firstIdx, firstLen: word.length });
+        }
       }
     } else {
       // density：全章统计一次
@@ -168,6 +202,8 @@ export function scanBannedWords(text: string, ruleSet?: Map<string, BannedWordRu
       if (count >= threshold && !densitySeen.has(word)) {
         densitySeen.add(word);
         const idx = text.indexOf(word);
+        // 白名单按首个命中位置近似豁免（组内词高频分散，逐位置豁免成本高且语义近似）
+        if (idx !== -1 && hitWhitelisted(text, idx, word.length, whitelist)) continue;
         issues.push({
           type: "RATIO",
           word,
@@ -178,6 +214,104 @@ export function scanBannedWords(text: string, ruleSet?: Map<string, BannedWordRu
           line: idx === -1 ? undefined : locateLine(text, idx),
         });
       }
+    }
+  }
+  // 组限频判定：合计次数 / 千字 >= perKilo 报一条
+  if (groupAgg.size) {
+    const kilo = Math.max(text.replace(/\s/g, "").length, 1) / 1000;
+    for (const [group, agg] of groupAgg) {
+      if (agg.count / kilo >= agg.perKilo) {
+        issues.push({
+          type: "RATIO",
+          word: `${group}(组)`,
+          kind: "density",
+          snippet: makeSnippet(text, agg.firstIdx, agg.firstLen),
+          count: agg.count,
+          threshold: agg.perKilo,
+          line: locateLine(text, agg.firstIdx),
+        });
+      }
+    }
+  }
+  return issues;
+}
+
+// ── AI 味句式扫描（SLOP · 去AI味三层融合方案·检测层） ──
+
+export interface SlopPattern {
+  /** 类别名（报告展示用） */
+  name: string;
+  /** 全局正则（调用方负责 g 标志与 lastIndex 复位） */
+  pattern: RegExp;
+  /** true=确定性 AI 句式（hard，触发返工）| false=读感提示（soft，报告级聚合一条） */
+  hard: boolean;
+  /** >0 时仅在文本末尾该字符数窗口内检测（章末升华类） */
+  tailWindow?: number;
+}
+
+/** AI 味句式正则（story-deslop Gate B/G 确定性子集；分级沿用其验证经验：blocking 只收确定性句式） */
+export const DEFAULT_SLOP_PATTERNS: SlopPattern[] = [
+  { name: "否定翻转(不是…而是)", pattern: /不是[^。，；？]{1,12}，?而是/g, hard: true },
+  { name: "上帝视角剧透", pattern: /(他|她)不知道的是|殊不知|仿佛预示|冥冥之中/g, hard: true },
+  { name: "声音描写套式", pattern: /声音不大，却带着|语气毫无波澜|平静无波/g, hard: true },
+  { name: "评论性插入", pattern: /这意味着|不得不说|值得一提/g, hard: true },
+  { name: "章末升华", pattern: /这一刻|终于明白|才刚刚开始|注定/g, hard: false, tailWindow: 200 },
+];
+
+/**
+ * 扫描 AI 味句式。
+ *
+ * 语义：
+ * - hard 类：每命中一次报一条 [SLOP]（kind=poison，供 scanProvider 映射 hard=true）
+ * - soft 类：同模式命中聚合成一条 [SLOP]（kind=density，报告级）
+ * - tailWindow：仅检测文本末尾窗口（章末升华只在结尾处才算问题）
+ */
+export function scanSlopPatterns(
+  text: string,
+  patterns: SlopPattern[] = DEFAULT_SLOP_PATTERNS,
+  whitelist: readonly string[] = [],
+): BannedScanIssue[] {
+  const issues: BannedScanIssue[] = [];
+  for (const p of patterns) {
+    const useTail = typeof p.tailWindow === "number" && p.tailWindow > 0 && text.length > p.tailWindow;
+    const target = useTail ? text.slice(-p.tailWindow!) : text;
+    const offset = useTail ? text.length - target.length : 0;
+    const regex = new RegExp(p.pattern.source, p.pattern.flags.includes("g") ? p.pattern.flags : `${p.pattern.flags}g`);
+    regex.lastIndex = 0;
+    const soft = { count: 0, firstIdx: -1, firstLen: 0 };
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(target)) !== null) {
+      const idx = offset + m.index;
+      if (p.hard) {
+        if (!hitWhitelisted(text, idx, m[0].length, whitelist)) {
+          issues.push({
+            type: "SLOP",
+            word: p.name,
+            kind: "poison",
+            snippet: makeSnippet(text, idx, m[0].length),
+            count: 1,
+            line: locateLine(text, idx),
+          });
+        }
+      } else {
+        soft.count++;
+        if (soft.firstIdx === -1) {
+          soft.firstIdx = idx;
+          soft.firstLen = m[0].length;
+        }
+      }
+      if (m.index === regex.lastIndex) regex.lastIndex++; // 零长匹配防护
+    }
+    if (!p.hard && soft.count > 0 && soft.firstIdx !== -1) {
+      issues.push({
+        type: "SLOP",
+        word: p.name,
+        kind: "density",
+        snippet: makeSnippet(text, soft.firstIdx, soft.firstLen),
+        count: soft.count,
+        threshold: 1,
+        line: locateLine(text, soft.firstIdx),
+      });
     }
   }
   return issues;

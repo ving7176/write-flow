@@ -26,6 +26,8 @@ const MANIFEST: string[] = [
   "pipeline/checkReport.ts",
   "pipeline/constraintChecker.ts",
   "pipeline/descriptionRatio.ts",
+  "pipeline/deslopLexicon.ts",
+  "pipeline/deslopPrompt.ts",
   "pipeline/eraScan.ts",
   "pipeline/humorSignal.ts",
   "pipeline/repeatDetect.ts",

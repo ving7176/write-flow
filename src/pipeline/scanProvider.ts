@@ -1,5 +1,6 @@
 import type { ScanIssue } from "@/agents/novelAgent/supervision";
-import { scanBannedWords, type BannedWordRule } from "@/pipeline/bannedWordScan";
+import { scanBannedWords, scanSlopPatterns, DEFAULT_SLOP_PATTERNS, type BannedWordRule } from "@/pipeline/bannedWordScan";
+import { DESLOP_RULES } from "@/pipeline/deslopLexicon";
 import { detectRepeats } from "@/pipeline/repeatDetect";
 import { computeDescriptionRatio } from "@/pipeline/descriptionRatio";
 import { checkChapterWords } from "@/pipeline/chapterWords";
@@ -24,6 +25,8 @@ export function createChapterScanProvider(options?: {
   bannedRules?: BannedWordRule[];
   wordMin?: number;
   wordMax?: number;
+  /** 去AI味白名单（workData.config.deslopWhitelist）：命中位置附近含白名单字面片段则豁免（防世界观术语误报） */
+  deslopWhitelist?: string[];
   /**
    * 世界观时代（修复③的章节路径缺口）：非章节扫描已从 era 约束 derive 传入，
    * 章节扫描器漏传 → 现代题材章节的「手机/直播」全被缺省 ancient 报 [ERA] 硬红线，
@@ -37,19 +40,31 @@ export function createChapterScanProvider(options?: {
   const bannedRules = options?.bannedRules ?? undefined;
   const wordMin = options?.wordMin ?? 2850;
   const wordMax = options?.wordMax ?? 3050;
+  const deslopWhitelist = options?.deslopWhitelist ?? [];
   const worldEra = options?.worldEra;
   const transportExemption = options?.transportExemption;
 
   return (content: string): ScanIssue[] => {
     const issues: ScanIssue[] = [];
 
-    // 1. 禁用词
-    const banned = scanBannedWords(content, new Map((bannedRules ?? []).map((r) => [r.word, r])));
+    // 1. 禁用词（去AI味词表 DESLOP_RULES 恒定并入，运行时约束词条后置覆盖——constraints 优先级最高）
+    const ruleMap = buildRuleSet([...DESLOP_RULES, ...(bannedRules ?? [])]);
+    const banned = scanBannedWords(content, ruleMap, deslopWhitelist);
     for (const b of banned) {
       issues.push({
         type: "BANNED",
         text: `[BANNED] 禁用词「${b.word}」x${b.count}` + (b.word.length ? `（上下文：${b.snippet || "—"}${b.line ? `，行 ${b.line}` : ""}）` : ""),
         hard: b.kind === "poison",
+      });
+    }
+
+    // 1b. AI 味句式（SLOP：hard=确定性句式触发返工，soft=报告级；去AI味三层融合方案·检测层）
+    const slop = scanSlopPatterns(content, DEFAULT_SLOP_PATTERNS, deslopWhitelist);
+    for (const s of slop) {
+      issues.push({
+        type: "SLOP",
+        text: `[SLOP] AI味句式「${s.word}」x${s.count}（上下文：${s.snippet || "—"}${s.line ? `，行 ${s.line}` : ""}）`,
+        hard: s.kind === "poison",
       });
     }
 
