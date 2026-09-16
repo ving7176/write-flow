@@ -253,7 +253,8 @@ export function buildRepairPrompt(current: RepairChapterInput, hardIssues: Super
 export function buildWordContinuePrompt(current: RepairChapterInput, issues: SupervisionIssue[]): string {
   const content = current.content ?? "";
   const curChars = content.replace(/\s+/g, "").length;
-  const gap = Math.max(WORD_TARGET + 50 - curChars, 150);
+  // gap 补偿系数：模型续写实际输出 ≈ 要求的 2/3（E2E 实测要求 400 实补 266），缓冲 +300 保证一次过线
+  const gap = Math.max(WORD_TARGET + 300 - curChars, 200);
   const tail = content.slice(-200);
   const issueText = issues.map((i) => i.text).join("；");
   return [
