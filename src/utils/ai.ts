@@ -328,23 +328,26 @@ class AiText {
     }
   }
 
-  /** 组装 generateText/streamText 入参（主/备用模型共用同一份 options 组装逻辑） */
+  /** 组装 generateText/streamText 入参（主/备用模型共用同一份 options 组装逻辑）。
+   *  input.timeoutMs（分场景超时）：覆盖默认 90s 硬超时（大输出场景如 3000 字章节生成 90s 必截断，
+   *  E2E 实测半截稿过闸）；该参数为本地约定，剥离后不下发 SDK。 */
   private async buildTextOptions(
     input: Record<string, unknown>,
     modelName: `${string}:${string}`,
     opts: { stream: boolean },
   ): Promise<Record<string, unknown>> {
+    const { timeoutMs, ...rest } = input;
     const config = await getModelConfig(this.AiType);
     return {
-      ...(typeof input.tools === "object" && input.tools !== null
-        ? { stopWhen: stepCountIs(Math.min(Object.keys(input.tools).length * 50, MAX_STEPS_ABSOLUTE)) }
+      ...(typeof rest.tools === "object" && rest.tools !== null
+        ? { stopWhen: stepCountIs(Math.min(Object.keys(rest.tools).length * 50, MAX_STEPS_ABSOLUTE)) }
         : {}),
-      ...input,
+      ...rest,
       model: await this.resolveModel(opts.stream ? extractReasoningMiddleware({ tagName: "reasoning_content", separator: "\n" }) : undefined, modelName),
       ...(config?.temperature && { temperature: config.temperature }),
       ...(config?.maxOutputTokens && { maxOutputTokens: config.maxOutputTokens }),
-      maxRetries: input.maxRetries ?? DEFAULT_MAX_RETRIES,
-      abortSignal: mergeAbortSignals(input.abortSignal as AbortSignal | undefined, DEFAULT_TIMEOUT_MS),
+      maxRetries: rest.maxRetries ?? DEFAULT_MAX_RETRIES,
+      abortSignal: mergeAbortSignals(rest.abortSignal as AbortSignal | undefined, typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS),
     };
   }
 

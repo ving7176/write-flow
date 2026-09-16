@@ -148,6 +148,23 @@ function nextIntId(): number {
   return (Date.now() % 2000000000) + Math.floor(Math.random() * 1000);
 }
 
+/** 剥离章名序号前缀（「第1章 · 穿越」「第12章·破局」「第一章 下山」→ 穿越/破局/下山）；剥后为空（纯「第N章」）返回空串 */
+export function stripChapterNoPrefix(name: string): string {
+  return (name ?? "")
+    .replace(/^\s*第\s*[0-9〇零一二三四五六七八九十百千]{1,6}\s*章\s*[·・•‥…．:：、\-—–]?[\s　]*/, "")
+    .trim();
+}
+
+/** 章卡标题查询（章名的唯一真相源；DB 异常降级空串，走剥前缀兜底） */
+async function getChapterPlanTitle(projectId: number, chapterIndex: number): Promise<string> {
+  try {
+    const row = (await u.db("o_chapter_plan").where({ projectId, chapterIndex }).select("title").first()) as { title?: string } | undefined;
+    return String(row?.title ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
 async function upsertNovelChapter(projectId: number, index: number, reel: string, chapter: string, content: string): Promise<number> {
   const row = (await u.db("o_novel").where({ projectId, chapterIndex: index }).first()) as { id: number; reel?: string; chapter?: string } | undefined;
   if (row) {
@@ -423,13 +440,31 @@ export async function consumeAgentOutput(
           handler: "system",
         }).catch(() => {});
       }
-      // 章号去重：同章键已存在（历史缺陷：修订版 append 出同章多版本）→ 覆盖原记录，不新增 index
-      // 章键用共享 chapterKey（兼容中文数字/楔子/序章/后缀），与前端 setPlanData/update_chapters 一致
+      // 章名代码裁定（A1：标题一致性不依赖模型自觉）：
+      // - 匹配键沿用模型输出章名（chapterKey 兼容修订后缀「第1章·下山」vs「第1章·下山（修订）」）
+      // - 落库标题以章卡 title 为唯一真相源（大纲层真相）；无章卡时剥离「第N章 ·」序号前缀兜底
+      // - 模型标题与裁定值不一致 → recordTrace 留痕观测（漂移率监控），不阻断
       const key = chapterKey(chapter);
       // 查全部已有章键做同章匹配（修订版后缀变化也能命中：如「第1章·下山」vs「第1章·下山（修订）」）
       // 性能：只取轻量列做去重（不拖 chapterData 全文——长篇几百章每章写前整本搬正文是最大 DB 热点）
       const rows = await u.db("o_novel").where("projectId", projectId).select("id", "chapterIndex", "chapter");
       const dup = (rows as any[]).find((r) => chapterKey(r.chapter) === key);
+      // index：修订覆盖命中时取既有章号，新章取 max+1（而非 count 总行数——删除章节后 count 与 index 错位，导致覆盖/跳号）
+      const index = dup ? dup.chapterIndex : await nextChapterNo(projectId);
+      const planTitle = await getChapterPlanTitle(projectId, index);
+      const stripped = stripChapterNoPrefix(chapter);
+      const finalChapter = planTitle || stripped || chapter;
+      const resolvedName = planTitle || stripped;
+      if (resolvedName && chapterKey(chapter) !== chapterKey(resolvedName)) {
+        await recordTrace({
+          projectId,
+          agentKey: "novelAgent",
+          stage: "chapter",
+          gate: "gate1_harness",
+          event: "fail",
+          detail: `[章名漂移] 模型输出「${chapter}」与裁定章名「${resolvedName}」不一致，已按章卡/剥前缀裁定落库`,
+        }).catch(() => {});
+      }
       if (dup) {
         // P1-2：覆盖前存旧稿快照（历史版本回滚；覆盖普通生成 + 监督返工稿，两路径都经 consumeAgentOutput 落库）
         // 性能（B3）：查重行不含 chapterData，快照用旧稿需单独取一次（仅修订覆盖时）
@@ -442,16 +477,14 @@ export async function consumeAgentOutput(
           chapterData: oldData?.chapterData ?? "",
           source: "regen",
         });
-        await u.db("o_novel").where({ id: dup.id }).update({ reel: reel || chapter, chapter, chapterData: content });
+        await u.db("o_novel").where({ id: dup.id }).update({ reel: reel || finalChapter, chapter: finalChapter, chapterData: content });
         // 批量路径（B7）：light 标记（置 done + 回填 volumeId），卷状态循环后统一重算
         const vid = await markChapterWrittenLight(projectId, dup.chapterIndex, dup.id);
         if (vid != null) touchedVolumes.add(vid);
         result.chapters++;
         continue;
       }
-      // index 取 max(chapterIndex)+1（而非 count 总行数——删除章节后 count 与 index 错位，导致覆盖/跳号）
-      const index = await nextChapterNo(projectId);
-      // R6 章名-索引错位观测（软告警不阻断）：章名自带的序号与实际落库 index 不一致 → 记 trace 供
+      // R6 章名-索引错位观测（软告警不阻断）：模型章名自带序号与实际落库 index 不一致 → 记 trace 供
       // 内容质量监控。E2E 实测样本：AI 合并大纲两段剧情并自称「第2章」，DB index=1 自洽但读者视角错位。
       // 仅在章名为阿拉伯数字「第N章」形态时比对（中文数字/楔子等跳过，保守不误报）
       const nameNum = /^(?:第\s*)(\d{1,3})(?:\s*章)/.exec(chapter ?? "");
@@ -465,7 +498,7 @@ export async function consumeAgentOutput(
           detail: `[章名错位] 章名含「第${nameNum[1]}章」与落库 chapterIndex=${index} 不一致，建议核对是否合并了多段大纲剧情`,
         }).catch(() => {});
       }
-      const novelId = await upsertNovelChapter(projectId, index, reel, chapter, content);
+      const novelId = await upsertNovelChapter(projectId, index, reel, finalChapter, content);
       const vid = await markChapterWrittenLight(projectId, index, novelId);
       if (vid != null) touchedVolumes.add(vid);
       result.chapters++;

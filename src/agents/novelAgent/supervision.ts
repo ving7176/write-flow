@@ -106,8 +106,17 @@ export function gradeRankOf(grade: string): number {
   return GRADE_RANK[g] ?? 0;
 }
 
-/** 稿质量对比：评级高者优；评级相同 hard 红线数少者优。返回 >0=a 更优，<0=a 更差，0=平 */
-export function compareQuality(a: { rank: number; hardCount: number }, b: { rank: number; hardCount: number }): number {
+/**
+ * 稿质量对比（B2 字数前置维）：**字数不达标者永远输**（字数不足不许通过，即使评级更高也不保留残次稿）；
+ * 双方达标时评级高者优；评级相同 hard 红线数少者优。返回 >0=a 更优，<0=a 更差，0=平
+ */
+export function compareQuality(
+  a: { rank: number; hardCount: number; wordOk?: boolean },
+  b: { rank: number; hardCount: number; wordOk?: boolean },
+): number {
+  const aw = a.wordOk !== false;
+  const bw = b.wordOk !== false;
+  if (aw !== bw) return aw ? 1 : -1;
   if (a.rank !== b.rank) return a.rank - b.rank;
   return b.hardCount - a.hardCount;
 }
@@ -157,6 +166,8 @@ export interface RepairStageTools {
   chapter: {
     execute?: (input: { prompt: string }, opts: unknown) => unknown;
   };
+  /** B2：章节字数下限（供 best 择优与 continue 式返工判定；缺省用 WORD_TARGET） */
+  chapterWordMin?: number;
 }
 
 export interface RepairResult {
@@ -168,6 +179,8 @@ export interface RepairResult {
   passed: boolean;
   /** 最优稿监督评级（P1c 章节质量门禁：C/D 时 full 模式强制停交人工） */
   grade?: string;
+  /** B2 字数硬闸：全部稿（含 best）字数未达标 → 调用方拒绝落库（不足不许通过），本章标失败 */
+  wordRejected?: boolean;
 }
 
 /** 从工具返回值提取 raw 字符串（ai SDK execute 返回 {raw, parsed?, error?} 或 string 或流，只认对象形态的 raw） */
@@ -209,6 +222,11 @@ const REPAIR_STRATEGY: Record<string, string> = {  BANNED: "替换为具体动�
 };
 
 export function buildRepairPrompt(current: RepairChapterInput, hardIssues: SupervisionIssue[]): string {
+  // B2 续写补足分支：**仅** WORD 类硬伤（正文达标线问题）时走续写式补足——
+  // 整章重生成有缩短方差（E2E 实测：2521 字稿两轮返工越修越短被拒收），续写是对短稿唯一稳定的修法
+  if (hardIssues.length > 0 && hardIssues.every((i) => i.type === "WORD")) {
+    return buildWordContinuePrompt(current, hardIssues);
+  }
   const byType = new Map<string, SupervisionIssue[]>();
   for (const i of hardIssues) byType.set(i.type, [...(byType.get(i.type) ?? []), i]);
   const guidance = [...byType.entries()].map(
@@ -229,6 +247,31 @@ export function buildRepairPrompt(current: RepairChapterInput, hardIssues: Super
     "- 必须遵守本书已确立的硬约束（见工作区数据），修复后不得引入新的矛盾",
     "- 输出**完整章节全文**（不是补丁），篇幅与原文相近",
   ].filter(Boolean).join("\n");
+}
+
+/** 字数不足的续写补足 prompt（B2）：原文逐字保留，只从结尾自然续写到达标——不触发整章重写的缩短方差 */
+export function buildWordContinuePrompt(current: RepairChapterInput, issues: SupervisionIssue[]): string {
+  const content = current.content ?? "";
+  const curChars = content.replace(/\s+/g, "").length;
+  const gap = Math.max(WORD_TARGET + 50 - curChars, 150);
+  const tail = content.slice(-200);
+  const issueText = issues.map((i) => i.text).join("；");
+  return [
+    "本章正文字数不足，执行**续写补足**任务（不是改写、不是重写）：",
+    "",
+    `字数验收：现有正文约 ${curChars} 字（要求 ${WORD_TARGET} 字以上）。${issueText}`,
+    "",
+    "续写要求：",
+    `- 从现有正文结尾**自然衔接**继续往下写约 ${gap} 字（场景延展/对话展开/动作细节/环境五感），使全文达到 ${WORD_TARGET}~${WORD_TARGET + 200} 字`,
+    "- **现有正文逐字保留**——禁止改写、删减、压缩任何已写内容",
+    "- 续写只用既有场景与人物（不新增情节/设定/人物），把正在发生的这一拍写透：反应、动作、一句对话、一个物件细节",
+    `- 写足字数后按原计划收尾：章尾钩子用动作/对话/悬念落点，${(current.chapter ?? "").trim() ? `本章是「${(current.chapter ?? "").trim()}」` : ""}结尾禁止总结升华`,
+    "",
+    "现有正文结尾（从这里接下去）：",
+    `……${tail}`,
+    "",
+    "输出**完整章节全文**（现有正文 + 续写部分合并为连续一文），不要输出补丁、说明或分隔标记。",
+  ].join("\n");
 }
 
 /**
@@ -261,9 +304,23 @@ export async function autoRepairChapter(
   let current: RepairChapterInput = { ...chapter };
   let currentRaw = raw;
   let attempts = 0;
-  // P1a 择优：已审核稿中的最优稿（首稿必入 best；返工稿不比 best 优时立即止损返回 best，
-  // 杜绝「B 级初稿被 D 级返工稿覆盖落库」——本次一键生成实测的返工劣化场景）
-  let best: { raw: string; parsed: unknown; rank: number; hardCount: number; grade: string } | null = null;
+  // 章节字数下限（B2 硬闸：不足不许通过，永不入库；continue 式返工补足）
+  const wordMin = stageTools.chapterWordMin ?? WORD_TARGET;
+  const wordOkOf = (content: string): boolean => {
+    const n = (content ?? "").replace(/\s+/g, "").length;
+    return n >= wordMin;
+  };
+  // P1a 择优 + B2 字数前置：best 以首稿为初值（wordOk=false 保守初始化，首轮审核后更新——
+  // 审核降级路径返回时 wordRejected 裁决仍成立）；返工稿仅「优于 best」才替换，
+  // 且 compareQuality 字数前置——字数不足稿即使评级高也不覆盖达标稿（杜绝 1484 字 B 级入库）
+  let best: { raw: string; parsed: unknown; rank: number; hardCount: number; grade: string; wordOk: boolean } = {
+    raw: currentRaw,
+    parsed: current,
+    rank: 0,
+    hardCount: 0,
+    grade: "",
+    wordOk: false,
+  };
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // 1. 监督审核当前稿
     let report: SupervisionReport | null = null;
@@ -277,15 +334,16 @@ export async function autoRepairChapter(
       report = parseSupervisionReport(reportRaw);
     } catch (e) {
       // 监督失败不阻断落库（沿用现有降级语义），2D：显式上报降级
+      // B2：降级返回也带 wordRejected——best 未更新时 wordOk=false（保守），消费端字数硬闸兜底拒收
       const msg = e instanceof Error ? e.message : String(e);
       console.warn("[novelAgent] 章节监督审核失败（不阻断落库）:", msg);
       onDegrade?.(`监督审核异常: ${msg}`);
-      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
     if (!report) {
       // 报告解析失败：降级不返工，2D：显式上报降级
       onDegrade?.("监督报告解析失败（未产出 <supervisionReport>）");
-      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
     // 批次2：每次审核报告透出（调用方落 o_check_report——人工写作章节检查/报告中心的章节监督数据源）
     onReport?.(report, reportRaw);
@@ -318,31 +376,30 @@ export async function autoRepairChapter(
       }
     }
     const hardIssues = [...llmHardIssues, ...numericIssues, ...scanHardIssues];
-    // 观察项1：字数远低标记（止损/耗尽落库时显式告警，不再静默残留半截章）
-    const wordShortfall = hardIssues.some((i) => i.type === "WORD" && i.text.includes("远低于目标下限"));
-    // P1a 择优：当前稿质量 vs 已审最优稿（首稿直接入 best）
+    // P1a 择优 + B2 字数前置：wordOk 单一权威源=scanProvider 的 WORD hard（区间含 config.words 口径）；
+    // 无 scanProvider 时回退 wordOkOf 内算（番茄可见字符口径）。双源并存会导致判定分裂（测试暴露）
     const rank = gradeRankOf(report.grade);
-    const curQuality = { rank, hardCount: hardIssues.length };
-    if (!best || compareQuality(curQuality, best) >= 0) {
-      best = { raw: currentRaw, parsed: current, rank, hardCount: hardIssues.length, grade: report.grade };
+    const curWordOk = scanProvider ? !scanHardIssues.some((i) => i.type === "WORD") : wordOkOf(current.content ?? "");
+    const curQuality = { rank, hardCount: hardIssues.length, wordOk: curWordOk };
+    if (attempts === 0 || compareQuality(curQuality, best) >= 0) {
+      best = { raw: currentRaw, parsed: current, rank, hardCount: hardIssues.length, grade: report.grade, wordOk: curQuality.wordOk };
     } else {
       // 返工稿劣化 → 立即止损返回最优稿（不再烧下一次返工）
       console.warn(`[novelAgent] 章节自动修复稿质量劣化（${best.grade}→${report.grade}），保留更优稿交人工（红线：${hardIssues.map((i) => i.type).join("/")}）`);
-      const shortfallNote = (best as { hasWordShortfall?: boolean }).hasWordShortfall
-        ? `；注意：保留稿字数未达标（远低于 ${WORD_TARGET}），建议人工续写补足或重做本章`
+      const shortfallNote = !best.wordOk
+        ? `；注意：保留稿字数未达标（低于 ${wordMin}），拒绝入库`
         : "";
       onDegrade?.(`返工稿质量劣化（${best.grade}→${report.grade}），保留更优稿交人工复核${shortfallNote}`);
-      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
-    if (typeof best === "object" && best) (best as { hasWordShortfall?: boolean }).hasWordShortfall = wordShortfall;
     if (hardIssues.length === 0) return attempts > 0 ? { raw: currentRaw, parsed: current, attempts, passed: true, grade: best?.grade } : null; // 通过 → 保持当前稿
     if (attempt >= maxRetries) {
       console.warn(`[novelAgent] 章节自动修复 ${maxRetries} 次仍未通过红线审核，落库最优稿交人工（红线：${hardIssues.map((i) => i.type).join("/")}）`);
-      const shortfallNote = wordShortfall || (best as { hasWordShortfall?: boolean }).hasWordShortfall
-        ? `；注意：字数未达标（远低于 ${WORD_TARGET}），已保留评级更优稿，建议人工续写补足`
+      const shortfallNote = !best.wordOk
+        ? `；注意：字数未达标（低于 ${wordMin}），拒绝入库`
         : "";
       onDegrade?.(`返工 ${maxRetries} 次耗尽仍不过红线（${hardIssues.map((i) => i.type).join("/")}），落库最优稿交人工复核${shortfallNote}`);
-      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
     // 3. 重生成（约束回灌）
     try {
@@ -360,12 +417,12 @@ export async function autoRepairChapter(
       }
       console.warn("[novelAgent] 章节自动修复重生成产物无效，落库最优稿:", String(extractField(regenResp, "error") ?? "无 error"));
       onDegrade?.("重生成产物无效（无 parsed），落库最优稿交人工复核");
-      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     } catch (e) {
       console.warn("[novelAgent] 章节自动修复失败（不阻断落库）:", e instanceof Error ? e.message : String(e));
       onDegrade?.(`章节自动修复异常: ${e instanceof Error ? e.message : String(e)}`);
-      return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
   }
-  return attempts > 0 && best ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade } : null;
+  return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
 }

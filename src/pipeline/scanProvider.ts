@@ -94,18 +94,13 @@ export function createChapterScanProvider(options?: {
       }
     }
 
-    // 4. 单章字数（>soft 报红线偏重；区间外但未超 soft 报告级）
-    //    C3 质量补漏：显著不足（< 下限 85%）升 hard 红线——E2E 实测 1300/2500 字稿 B 级放行的
-    //    质量漏洞（原 soft 报告级不返工）；15% 容差防轻微不足过度返工，best 择优保护防返工劣化
+    // 4. 单章字数（B2 代码硬闸加强：区间外一律 hard——不足不许通过（拒绝入库由调用端裁决），超限同样不放行；
+    //    原 85% 容差与 soft 超限缓冲废除：容差只让残次稿溜进库（E2E 实测 1484/2018 字稿入库的病灶））
     const words = checkChapterWords(content, { min: wordMin, max: wordMax });
-    if (words.overLimit) {
-      issues.push({ type: "WORD", text: `[WORD] 章节字数 ${words.count} 超上线（soft ${Math.round(wordMax * 1.05)}）`, hard: true });
-    } else if (words.count < Math.round(wordMin * 0.85)) {
-      issues.push({ type: "WORD", text: `[WORD] 章节字数 ${words.count} 远低于目标下限（${wordMin}），须补足至目标字数`, hard: true });
-    } else if (words.count < wordMin) {
-      issues.push({ type: "WORD", text: `[WORD] 章节字数 ${words.count} < ${wordMin}`, hard: false });
+    if (words.count < wordMin) {
+      issues.push({ type: "WORD", text: `[WORD] 章节字数 ${words.count} < 下限 ${wordMin}，必须补足至 ${wordMin}-${wordMax} 字（在既有内容上扩写场景/对话/动作，禁止重写已写好的部分）`, hard: true });
     } else if (words.count > wordMax) {
-      issues.push({ type: "WORD", text: `[WORD] 章节字数 ${words.count} > ${wordMax}（超目标，未过 soft）`, hard: false });
+      issues.push({ type: "WORD", text: `[WORD] 章节字数 ${words.count} > 上限 ${wordMax}，压缩冗余描写/对话至 ${wordMin}-${wordMax} 字（禁止整段删除剧情功能）`, hard: true });
     }
 
     // 5. 时代错位（非现代世界观命中现代词 → [ERA] 硬红线，HARD_REDLINE_TYPES 含 ERA）

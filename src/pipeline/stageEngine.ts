@@ -139,13 +139,16 @@ export interface StageHooks {
    * @param promptProvided prompt 是否由调用方显式传入（false 表示引擎已用项目 intro 兜底）
    */
   beforeRunStage?: (ctx: AgentContext, stageKey: string, prompt: string, promptProvided: boolean) => Promise<{ prompt?: string; error?: string }>;
-  /** 子 Agent 产物通过 Gate2 后、返回前（novel: chapter 深度监督审核 + hard 红线自动修复，返回覆盖稿替换原稿） */
+  /**
+   * 子 Agent 产物通过 Gate2 后、返回前（novel: chapter 深度监督审核 + hard 红线自动修复，返回覆盖稿替换原稿）。
+   * 返回 error 视为本阶段产物失败（不落库；B2 字数硬闸：全部稿字数未达标 → 拒绝入库标失败可重试）。
+   */
   afterSubAgent?: (
     ctx: AgentContext,
     stageKey: string,
     resp: { raw: string; parsed?: unknown },
     stageTools: StageToolMap,
-  ) => Promise<{ raw: string; parsed?: unknown } | void>;
+  ) => Promise<{ raw: string; parsed?: unknown; error?: string } | void>;
   /** 阶段落库后（novel: brief 自动立项） */
   onStagePersisted?: (projectId: number, stageKey: string) => Promise<void>;
   /**
@@ -538,6 +541,10 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
       // afterSubAgent 可返回覆盖稿（novel chapter 自动修复闭环：hard 红线重生成后的最优稿替换原稿，
       // 落库发生在 runStageDirect 返回之后，保证最终落库的始终是修复后的版本）
       const afterResp = await hooks?.afterSubAgent?.(ctx, stageKey, { raw, parsed: respObj.parsed }, stageTools);
+      // B2 字数硬闸消费端：afterSubAgent 返回 error → 本阶段失败不落库（retryable，工作流层标错中断连写并告警）
+      if (afterResp && (afterResp as { error?: string }).error) {
+        return { raw: "", error: String((afterResp as { error?: string }).error), retryable: true };
+      }
       if (afterResp && typeof afterResp.raw === "string" && afterResp.raw) {
         raw = afterResp.raw;
         respObj = { raw: afterResp.raw, parsed: afterResp.parsed };
