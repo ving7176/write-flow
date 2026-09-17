@@ -459,6 +459,24 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
   function clearPendingReview(pid: number): Promise<void> {
     return queueGenerationMeta(pid, () => ({ pendingReview: null })).then(() => undefined);
   }
+  /** B2 think 升级计数：同章字数拒收累计（队列内读改写，避免与 pendingReview/运行位互相覆盖——直写事故实测） */
+  function bumpWordRetry(pid: number, chapterIndex: number): Promise<number> {
+    return queueGenerationMeta(pid, (gen) => {
+      const prev = gen.wordRetry as { chapterIndex?: number; count?: number } | undefined;
+      const count = prev && prev.chapterIndex === chapterIndex ? (prev.count ?? 0) + 1 : 1;
+      gen.wordRetry = { chapterIndex, count };
+      return { ...gen, wordRetry: gen.wordRetry };
+    }).then(() => {
+      // 队列外重读拿最终 count（队列串行，此时必为最新）
+      return getWorkData(pid).then((data) => {
+        const wr = (data.generation as { wordRetry?: { count?: number } } | undefined)?.wordRetry;
+        return wr?.count ?? 1;
+      });
+    });
+  }
+  function clearWordRetry(pid: number): Promise<void> {
+    return queueGenerationMeta(pid, (gen) => ({ ...gen, wordRetry: null })).then(() => undefined);
+  }
 
   /**
    * 缺口查找：单字段阶段空 → 缺口；chapter 阶段无已写章节 → 缺口；episode 阶段无已写集 → 缺口；
@@ -1092,5 +1110,5 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
     });
   }
 
-  return { runWorkflow, runStageDirect, persistStage, runSupervision, makeWorkflowStageTool, makeStageCheckTool, getWorkData, genMeta: { markPendingReview, clearPendingReview } };
+  return { runWorkflow, runStageDirect, persistStage, runSupervision, makeWorkflowStageTool, makeStageCheckTool, getWorkData, genMeta: { markPendingReview, clearPendingReview, bumpWordRetry, clearWordRetry } };
 }
