@@ -433,14 +433,15 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
   /** 开始一次生成尝试：登记运行位（写完成即 resolve），返回 attemptId 供收尾判定 */
   function beginGenerationMeta(pid: number, stageKey: string | null): Promise<string> {
     const attemptId = `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-    return queueGenerationMeta(pid, () => ({ running: true, startedAt: Date.now(), stageKey, endedAt: null, attemptId })).then(() => attemptId);
+    // 合并写（不整体替换）：wordRetry/pendingReview 等持久键不能被运行位登记清掉
+    return queueGenerationMeta(pid, (gen) => ({ ...gen, running: true, startedAt: Date.now(), stageKey, endedAt: null, attemptId })).then(() => attemptId);
   }
   /** 结束一次生成尝试（幂等防交错）：仅当运行位仍是自己的 attempt 才写收尾 */
   function endGenerationMeta(pid: number, attemptId: string): Promise<void> {
     return queueGenerationMeta(pid, (gen) =>
       typeof gen.attemptId === "string" && gen.attemptId !== attemptId
         ? gen
-        : { running: false, stageKey: (gen.stageKey as string | null) ?? null, endedAt: Date.now() },
+        : { ...gen, running: false, stageKey: (gen.stageKey as string | null) ?? null, endedAt: Date.now() },
     ).then(() => undefined);
   }
 
@@ -454,10 +455,11 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
     blockedAt: number;
   }
   function markPendingReview(pid: number, review: Omit<PendingReview, "blockedAt">): Promise<void> {
-    return queueGenerationMeta(pid, () => ({ pendingReview: { ...review, blockedAt: Date.now() } })).then(() => undefined);
+    // 合并写（不整体替换）：运行途中调用不能清掉 running/attemptId/wordRetry
+    return queueGenerationMeta(pid, (gen) => ({ ...gen, pendingReview: { ...review, blockedAt: Date.now() } })).then(() => undefined);
   }
   function clearPendingReview(pid: number): Promise<void> {
-    return queueGenerationMeta(pid, () => ({ pendingReview: null })).then(() => undefined);
+    return queueGenerationMeta(pid, (gen) => ({ ...gen, pendingReview: null })).then(() => undefined);
   }
   /** B2 think 升级计数：同章字数拒收累计（队列内读改写，避免与 pendingReview/运行位互相覆盖——直写事故实测） */
   function bumpWordRetry(pid: number, chapterIndex: number): Promise<number> {

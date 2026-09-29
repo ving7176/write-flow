@@ -42,6 +42,11 @@
 1. 与用户确认章节清单（去重；与上轮重叠合并为一次批量覆盖，避免重复触发平台重审）
 2. 对照 publishRecord：未改章（hash 相同）自动 skip
 
+### 0.5 发布前置检查（全部通过才允许执行发布）
+1. **对账**：拉取平台章节管理页最新列表（章号/标题/字数），与 publishRecord 逐条比对；发现漂移（章号不连续、标题/内容不符、记录缺失）先修复再操作，禁止带漂移发布
+2. **连续性**：待发布起始章号 = publishRecord 最大章号 + 1，按序连续，禁止跳章（根 AGENTS.md 双游标硬规则）
+3. **内容就绪**：每章在 o_novel 存在且字数达标（config.words 区间）；缺章或残次稿先回补再发
+
 ### 1. 登录与定位
 1. 打开 `https://fanqienovel.com/main/writer/chapter-manage/<作品ID>?type=1`；跳登录页则扫码（凭证只有用户有）
 2. 列表倒序、每页 15 章，页码 = ceil((总章数 - 章节号 + 1) / 15)；翻页用 getByRole("listitem", { name: "第 N 页" })（数字文本须 role+name 定位）
@@ -60,3 +65,11 @@
 ### 4. 发布后
 1. 逐章验证列表行状态/字数
 2. 更新 publishRecord（合并回写）+ 向用户汇报发布清单
+
+### 5. 绕过管线的操作收尾（硬性，缺一即未完成）
+任何不走 novelAgent 管线的入库/改号/换内容操作（手工落库、平台改章号、平台换正文、driver 外补稿），收尾必须同步四件套并逐项验证：
+1. **stateLedger**：推进至最新已入库章（角色位置/持有物/近10章事件）
+2. **timeLine**：新增章时间锚（sortKey 需按全局故事时间核对，抽取器只给相对锚）
+3. **foreshadows**：新埋点补登（plantedAt/plannedResolve/status）
+4. **publishRecord**：最终章号/标题/字数/hash 与 DB o_novel 实际内容重算一致（禁止按旧章号映射旧 hash）
+四件套缺任一项即操作未完成；完成后 CHANGELOG 记录。
