@@ -19,8 +19,11 @@ import type { ScanIssue } from "@/agents/novelAgent/supervision";
 import path from "path";
 import fs from "fs";
 
-/** 4B：工具级超时（LLM 调用层 90s，工具含生成+解析给 180s 余量） */
+/** 4B：工具级超时（LLM 调用层 90s，工具含生成+解析给 180s 余量）。
+ *  chapter 阶段例外：execute 含生成(480s think)+监督(×4)+返工(≤3 轮)全闭环，180s 必腰斩
+ *  （E2E 实测 215 连续多轮 [TIMEOUT] 180000ms 半截稿过闸——ai 层超时提额被工具闸抢先失效） */
 const TOOL_TIMEOUT_MS = 180_000;
+const CHAPTER_TOOL_TIMEOUT_MS = 1_800_000;
 
 /**
  * P1c 质量门禁：单阶段质检重做上限（非章节阶段 C/D 自动重做次数，与章节返工上限一致；
@@ -546,8 +549,9 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
     const attemptId = await beginGenerationMeta(pid, stageKey);
     try {
       let resp: unknown;
+      const toolTimeout = def?.chapter ? CHAPTER_TOOL_TIMEOUT_MS : TOOL_TIMEOUT_MS;
       try {
-        resp = await withToolTimeout(subAgent.execute, TOOL_TIMEOUT_MS)(
+        resp = await withToolTimeout(subAgent.execute, toolTimeout)(
           { prompt },
           { toolCallId: `stage-${stageKey}`, messages: [] },
         );
