@@ -75,7 +75,9 @@ export function parseMetricsBlock(raw: string): Record<string, unknown> | null {
  * @returns 结构化报告；标签缺失或格式无法解析返回 null
  */
 export function parseSupervisionReport(raw: string): SupervisionReport | null {
-  const m = raw.match(/<supervisionReport>([\s\S]*?)<\/supervisionReport>/);
+  // 容错（MiMo 系模型）：先剥 ``` 代码围栏再匹配——模型常把结构化 XML 包进围栏输出
+  const cleaned = (raw ?? "").replace(/```[a-zA-Z]*\n?/g, "");
+  const m = cleaned.match(/<supervisionReport>([\s\S]*?)<\/supervisionReport>/);
   if (!m) return null;
   const body = m[1];
   const grade = body.match(/<grade>([\s\S]*?)<\/grade>/)?.[1]?.trim() ?? "";
@@ -342,8 +344,21 @@ export async function autoRepairChapter(
       return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
     if (!report) {
-      // 报告解析失败：降级不返工，2D：显式上报降级
-      onDegrade?.("监督报告解析失败（未产出 <supervisionReport>）");
+      // 报告解析失败：先重试一次监督（MiMo 系输出格式有方差，一次重试消掉大半），再失败才降级
+      console.warn("[novelAgent] 监督报告解析失败，重试一次监督审核");
+      try {
+        const retryResp = await stageTools.run_sub_agent_supervision.execute?.(
+          { prompt: buildSupervisionPrompt(current) },
+          { toolCallId: `stage-chapter-supervision-retry-${attempt}`, messages: [] },
+        );
+        report = parseSupervisionReport(extractRaw(retryResp));
+      } catch (e) {
+        console.warn("[novelAgent] 监督重试仍异常:", e instanceof Error ? e.message : String(e));
+      }
+    }
+    if (!report) {
+      // 重试后仍解析失败：降级不返工，2D：显式上报降级
+      onDegrade?.("监督报告解析失败（重试后仍未产出 <supervisionReport>）");
       return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
     // 批次2：每次审核报告透出（调用方落 o_check_report——人工写作章节检查/报告中心的章节监督数据源）
