@@ -565,9 +565,12 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
       // afterSubAgent 可返回覆盖稿（novel chapter 自动修复闭环：hard 红线重生成后的最优稿替换原稿，
       // 落库发生在 runStageDirect 返回之后，保证最终落库的始终是修复后的版本）
       const afterResp = await hooks?.afterSubAgent?.(ctx, stageKey, { raw, parsed: respObj.parsed }, stageTools);
-      // B2 字数硬闸消费端：afterSubAgent 返回 error → 本阶段失败不落库（retryable，工作流层标错中断连写并告警）
+      // B2 字数硬闸消费端：afterSubAgent 返回 error → 本阶段失败不落库（工作流层标错中断连写并告警）。
+      // retryable 只留给 GATE2 格式错：REJECT_WORD/QUOTA 标 retryable 会走 2C「格式错重试」，
+      // 重生成产物绕过 afterSubAgent 字数闸直接落库（2026-10-02 220 实证 531/1628 字残稿两度漏网）且双倍烧 token
       if (afterResp && (afterResp as { error?: string }).error) {
-        return { raw: "", error: String((afterResp as { error?: string }).error), retryable: true };
+        const afterErr = String((afterResp as { error?: string }).error);
+        return { raw: "", error: afterErr, retryable: afterErr.startsWith("[GATE2]") };
       }
       if (afterResp && typeof afterResp.raw === "string" && afterResp.raw) {
         raw = afterResp.raw;

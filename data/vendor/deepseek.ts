@@ -143,7 +143,7 @@ const vendor: VendorConfig = {
   },
   models: [
     { name: "DeepSeek V4 Pro", modelName: "deepseek-v4-pro", type: "text", think: true },
-    { name: "DeepSeek V4 Flash", modelName: "deepseek-v4-flash", type: "text", think: true },
+    { name: "DeepSeek V4.1 Flash", modelName: "deepseek-v4.1-flash", type: "text", think: true },
   ],
 };
 

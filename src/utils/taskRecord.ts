@@ -1,4 +1,5 @@
 import u from "@/utils";
+import { computeCost } from "@/utils/priceTable";
 
 const taskStateMap = {
   "0": "进行中",
@@ -6,12 +7,13 @@ const taskStateMap = {
   "-1": "生成失败",
 };
 
-/** token 用量（P0-2 计量：AiText 调用结束时回写 o_tasks） */
+/** token 用量（P0-2 计量：AiText 调用结束时回写 o_tasks；promptHash 为 WP2 可追溯的 prompt 指纹） */
 export interface TokenUsage {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
   cost?: number;
+  promptHash?: string;
 }
 
 /**
@@ -70,7 +72,9 @@ export default async function taskRecord(
       patch.promptTokens = usage.promptTokens ?? null;
       patch.completionTokens = usage.completionTokens ?? null;
       patch.totalTokens = usage.totalTokens ?? null;
-      patch.cost = usage.cost ?? null;
+      // WP6 成本结算：调用方未给 cost 时按价表结算（未登记价目的模型保持 NULL，不估算）
+      patch.cost = usage.cost ?? computeCost(modelName, usage.promptTokens, usage.completionTokens) ?? null;
+      patch.promptHash = usage.promptHash ?? null;
     }
     await u.db("o_tasks")
       .where("id", id)

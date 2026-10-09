@@ -251,29 +251,85 @@ export function buildRepairPrompt(current: RepairChapterInput, hardIssues: Super
   ].filter(Boolean).join("\n");
 }
 
-/** 字数不足的续写补足 prompt（B2）：原文逐字保留，只从结尾自然续写到达标——不触发整章重写的缩短方差 */
+/** B2b 续写合并（标记契约共用）：模型按【续】标记只输出新增段，应用侧与原稿合并；
+ * 无标记时按长度形态判定：<0.7×原稿＝续写片段照常合并（标记遵守率低，2026-10-02 实测），
+ * ≥0.7×＝压缩改写（实测比原稿 1.09 倍），采用会丢内容，返回 ok=false */
+export function mergeWordContinue(prevContent: string, regenContent: string): { ok: true; content: string } | { ok: false } {
+  const rc = (regenContent ?? "").trim();
+  if (!rc) return { ok: false };
+  const markerIdx = rc.indexOf("【续】");
+  if (markerIdx >= 0) {
+    const cont = rc.slice(markerIdx + "【续】".length).trim();
+    return { ok: true, content: `${prevContent}\n\n${cont}` };
+  }
+  if (prevContent.length > 60 && rc.includes(prevContent.slice(0, 60))) {
+    return { ok: true, content: rc }; // 模型直接输出了合并全文
+  }
+  if (prevContent.length > 60 && rc.length < prevContent.length * 0.7) {
+    console.warn(`[novelAgent] 续写补足：模型未带【续】标记但长度呈片段特征（${rc.length}/${prevContent.length}），按续写合并`);
+    return { ok: true, content: `${prevContent}\n\n${rc}` };
+  }
+  return { ok: false };
+}
+
+/** 字数不足的续写补足 prompt（B2）：原文由应用侧保留合并，模型只输出【续】标记后的新增内容——
+ * 「输出合并全文」契约实测被模型违反（压缩改写致 2839 字 < 原稿，2026-10-02 老牛 219），
+ * 标记契约下模型只写新增段，压缩路径在结构上不可达 */
 export function buildWordContinuePrompt(current: RepairChapterInput, issues: SupervisionIssue[]): string {
   const content = current.content ?? "";
   const curChars = content.replace(/\s+/g, "").length;
-  // gap 补偿系数：模型续写实际输出 ≈ 要求的 2/3（E2E 实测要求 400 实补 266），缓冲 +300 保证一次过线
-  const gap = Math.max(WORD_TARGET + 300 - curChars, 200);
+  // 超上限分支：WORD hard 也含「超 3050」（2026-10-02 223 实证丧仪章稿全在上限侧越界）——
+  // 超限走定点压缩（保留全部节拍/钩子，只删冗余），绝不能套「续写补足」模板（对超长稿是胡话）
+  if (curChars > WORD_TARGET + 200) {
+    const excess = curChars - (WORD_TARGET + 200);
+    // 微超额（<250 字）：整句删除模式——「删 1-3 句」是良构任务，结构压缩会一刀到底（实测 3114→1785）
+    if (excess < 250) {
+      return [
+        "本章正文字数轻微超上限，执行**整句删除**任务（不是压缩、不是改写）：",
+        "",
+        `字数验收：现有正文约 ${curChars} 字，仅超上限约 ${excess} 字。`,
+        "",
+        "删除要求：",
+        `- 只删除 1~3 句最可有可无的句子（重复描写/可省略的环境静景/不承载信息的对白），删除总量约 ${excess + 60} 字`,
+        "- **其余正文一字不动**——节拍、对话回合、章尾钩子全部原样保留，禁止改写任何保留句",
+        "- 输出**删除后的完整章节全文**（XML 三字段格式与原稿一致），不要输出删改说明",
+      ].join("\n");
+    }
+    const trimTarget = WORD_TARGET - Math.round((curChars - WORD_TARGET) * 0.5);
+    return [
+      "本章正文字数超上限，执行**定点压缩**任务（不是重写、不是删情节）：",
+      "",
+      `字数验收：现有正文约 ${curChars} 字，超出上限 ${WORD_TARGET + 200} 字。要求压缩至 ${Math.max(trimTarget, WORD_TARGET - 100)}~${WORD_TARGET + 50} 字。`,
+      "",
+      "压缩要求：",
+      "- **保留全部节拍、对话的信息功能与章尾钩子**——只删冗余：重复描写、可合并的动作分解、拖节奏的环境静景、同义反复的对白",
+      "- 每处删减保持上下文连贯，禁止删出逻辑断档；对话只收紧不删回合",
+      "- 输出**压缩后的完整章节全文**（XML 三字段格式与原稿一致），不要输出删改说明",
+    ].join("\n");
+  }
+  // gap 补偿系数：模型续写实际输出 ≈ 要求的 2/3（E2E 实测要求 400 实补 266）；目标对齐窗口中值 2950——
+  // 目标 3150 会 overshoot 上限 3050（2026-10-02 219 实测合并稿 3209 字被超限硬闸拒收）
+  const gap = Math.max(Math.round(WORD_TARGET + 100 - curChars * 0.9), 200);
   const tail = content.slice(-200);
   const issueText = issues.map((i) => i.text).join("；");
   return [
-    "本章正文字数不足，执行**续写补足**任务（不是改写、不是重写）：",
+    "本章正文字数不足，执行**续写补足**任务（不是改写、不是重写、不是缩写）：",
     "",
     `字数验收：现有正文约 ${curChars} 字（要求 ${WORD_TARGET} 字以上）。${issueText}`,
     "",
     "续写要求：",
-    `- 从现有正文结尾**自然衔接**继续往下写约 ${gap} 字（场景延展/对话展开/动作细节/环境五感），使全文达到 ${WORD_TARGET}~${WORD_TARGET + 200} 字`,
-    "- **现有正文逐字保留**——禁止改写、删减、压缩任何已写内容",
+    "- **第一行只输出标记【续】，随后空一行开始续写正文**——禁止重复、改写、压缩、概述任何已写内容",
+    `- 从现有正文结尾自然衔接继续往下写约 ${gap} 字（场景延展/对话展开/动作细节/环境五感）`,
     "- 续写只用既有场景与人物（不新增情节/设定/人物），把正在发生的这一拍写透：反应、动作、一句对话、一个物件细节",
     `- 写足字数后按原计划收尾：章尾钩子用动作/对话/悬念落点，${(current.chapter ?? "").trim() ? `本章是「${(current.chapter ?? "").trim()}」` : ""}结尾禁止总结升华`,
     "",
     "现有正文结尾（从这里接下去）：",
     `……${tail}`,
     "",
-    "输出**完整章节全文**（现有正文 + 续写部分合并为连续一文），不要输出补丁、说明或分隔标记。",
+    `输出格式（XML 契约与续写标记并存，缺一不可）：`,
+    `<chapterItem><reel>${current.reel ?? "卷"}</reel><chapter>${(current.chapter ?? "").trim() || "本章"}</chapter><content>【续】`,
+    `（这里从第二行开始只写续写的新增正文，写足后按原计划收尾）</content></chapterItem>`,
+    "【续】标记必须在 <content> 标签内第一行；标记后只有新增正文，不要重复已有内容，不要输出说明。",
   ].join("\n");
 }
 
@@ -303,6 +359,9 @@ export async function autoRepairChapter(
   /** 观察项2修复：与系统事实矛盾的 LLM hard 类型抑制（worldEra=modern 时抑制 LLM 的 [ERA]——
    *  代码扫描是 era 权威判定源，LLM 偶发判不稳定浪费返工次数）；报告级仍展示 */
   suppressLlmTypes?: string[],
+  /** WP6 任务级预算：每轮返工前检查，返回非空 reason 即中止返工走既有降级（落最优稿交人工），
+   *  防预算超限后继续烧 token（0.95^n 误差复利前置拦截）；不传=不设中止 */
+  shouldAbort?: () => string | null,
 ): Promise<RepairResult | null> {
   let current: RepairChapterInput = { ...chapter };
   let currentRaw = raw;
@@ -325,6 +384,24 @@ export async function autoRepairChapter(
     wordOk: false,
   };
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // 降级返回统一出口：监督没能评级时沿用「监督失败不阻断落库」语义，但 best 若字数不达标
+    // 必被消费端字数硬闸拒收——此时当前稿（已过 GATE2）字数达标则放行当前稿（续写补足稿
+    // 因监督输出方差被整份丢弃的实测根因，2026-10-02 老牛 219）；两者都不达标才退 best 走拒收
+    const degradedReturn = () => {
+      if (!best.wordOk && wordOkOf(current.content ?? "")) {
+        console.warn("[novelAgent] 监督降级但当前稿字数达标，按不阻断语义放行当前稿交人工复核");
+        return { raw: currentRaw, parsed: current, attempts, passed: false, grade: best.grade, wordRejected: false };
+      }
+      return attempts > 0
+        ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk }
+        : null;
+    };
+    // WP6：预算中止检查（每轮返工前）——超限走既有降级语义，不抛错不丢已生成的最优稿
+    const abortReason = shouldAbort?.();
+    if (abortReason) {
+      onDegrade?.(abortReason);
+      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
+    }
     // 1. 监督审核当前稿
     let report: SupervisionReport | null = null;
     let reportRaw = "";
@@ -341,7 +418,7 @@ export async function autoRepairChapter(
       const msg = e instanceof Error ? e.message : String(e);
       console.warn("[novelAgent] 章节监督审核失败（不阻断落库）:", msg);
       onDegrade?.(`监督审核异常: ${msg}`);
-      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
+      return degradedReturn();
     }
     if (!report) {
       // 报告解析失败：先重试一次监督（MiMo 系输出格式有方差，一次重试消掉大半），再失败才降级
@@ -359,7 +436,7 @@ export async function autoRepairChapter(
     if (!report) {
       // 重试后仍解析失败：降级不返工，2D：显式上报降级
       onDegrade?.("监督报告解析失败（重试后仍未产出 <supervisionReport>）");
-      return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
+      return degradedReturn();
     }
     // 批次2：每次审核报告透出（调用方落 o_check_report——人工写作章节检查/报告中心的章节监督数据源）
     onReport?.(report, reportRaw);
@@ -417,15 +494,34 @@ export async function autoRepairChapter(
       onDegrade?.(`返工 ${maxRetries} 次耗尽仍不过红线（${hardIssues.map((i) => i.type).join("/")}），落库最优稿交人工复核${shortfallNote}`);
       return attempts > 0 ? { raw: best.raw, parsed: best.parsed, attempts, passed: false, grade: best.grade, wordRejected: !best.wordOk } : null;
     }
-    // 3. 重生成（约束回灌）
+    // 3. 重生成（约束回灌）；WORD-only 硬伤走续写补足（标记契约，见 buildWordContinuePrompt）
+    const useContinue = hardIssues.length > 0 && hardIssues.every((i) => i.type === "WORD");
+    const prevContent = current.content ?? "";
     try {
       const regenResp = await stageTools.chapter.execute?.(
-        { prompt: buildRepairPrompt(current, hardIssues) },
+        { prompt: useContinue ? buildWordContinuePrompt(current, hardIssues) : buildRepairPrompt(current, hardIssues) },
         { toolCallId: `stage-chapter-regen-${attempt}`, messages: [] },
       );
       const regenParsed = extractField(regenResp, "parsed");
       if (regenParsed) {
-        current = { ...(regenParsed as RepairChapterInput) };
+        const regen = { ...(regenParsed as RepairChapterInput) };
+        if (useContinue && (regen.content ?? "").trim()) {
+          const merged = mergeWordContinue(prevContent, regen.content ?? "");
+          if (merged.ok) {
+            if (merged.content !== (regen.content ?? "").trim()) {
+              const prevVisible = prevContent.replace(/\s+/g, "").length;
+              const contVisible = merged.content.replace(/\s+/g, "").length - prevVisible;
+              console.warn(`[novelAgent] 续写补足：按【续】标记合并（原稿 ${prevVisible} 字 + 续写 ${contVisible} 字）`);
+            }
+            regen.content = merged.content;
+          } else {
+            // 无标记且非全文＝压缩改写（违反逐字保留）——采用会丢内容，弃用本次产物走降级
+            console.warn("[novelAgent] 续写补足产物无效（无【续】标记且非全文，疑似压缩改写）");
+            onDegrade?.("续写补足产物无效（无【续】标记且非全文）");
+            return degradedReturn();
+          }
+        }
+        current = regen;
         const regenRaw = extractRaw(regenResp);
         if (regenRaw) currentRaw = regenRaw;
         attempts++;

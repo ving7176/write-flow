@@ -1,4 +1,4 @@
-// @db-hash ca0f38b5c2de2a46edfb491a0596251c
+// @db-hash 06eac74af6058cdbde7fca1369d1d862
 //该文件由脚本自动生成，请勿手动修改
 
 export interface memories {
@@ -54,6 +54,16 @@ export interface o_artStyle {
   'label'?: string | null;
   'name'?: string | null;
   'prompt'?: string | null;
+}
+export interface o_badcase {
+  'chapterKey'?: string | null;
+  'createTime'?: number | null;
+  'detail'?: string | null;
+  'id': number;
+  'projectId'?: number | null;
+  'source'?: string | null;
+  'status'?: string | null;
+  'updateTime'?: number | null;
 }
 export interface o_chapter_arc {
   'arcIndex'?: number | null;
@@ -356,6 +366,14 @@ export interface o_setting {
   'key': string;
   'value'?: string | null;
 }
+export interface o_skill_version {
+  'content'?: string | null;
+  'createTime'?: number | null;
+  'id': number;
+  'kind'?: string | null;
+  'path'?: string | null;
+  'source'?: string | null;
+}
 export interface o_skillAttribution {
   'attribution': string;
   'skillId': string;
@@ -396,6 +414,7 @@ export interface o_tasks {
   'id'?: number;
   'model'?: string | null;
   'projectId'?: number | null;
+  'promptHash'?: string | null;
   'promptTokens'?: number | null;
   'reason'?: string | null;
   'relatedObjects'?: string | null;
@@ -467,6 +486,7 @@ export interface DB {
   "o_agentDeploy": o_agentDeploy;
   "o_agentWorkData": o_agentWorkData;
   "o_artStyle": o_artStyle;
+  "o_badcase": o_badcase;
   "o_chapter_arc": o_chapter_arc;
   "o_chapter_plan": o_chapter_plan;
   "o_chapter_version": o_chapter_version;
@@ -494,6 +514,7 @@ export interface DB {
   "o_series": o_series;
   "o_series_setting": o_series_setting;
   "o_setting": o_setting;
+  "o_skill_version": o_skill_version;
   "o_skillAttribution": o_skillAttribution;
   "o_skillList": o_skillList;
   "o_stage_version": o_stage_version;

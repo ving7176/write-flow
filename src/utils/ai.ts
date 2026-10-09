@@ -2,8 +2,11 @@ import { generateText, streamText, wrapLanguageModel, stepCountIs, extractReason
 import { devToolsMiddleware } from "@ai-sdk/devtools";
 import axios from "axios";
 import { transform } from "sucrase";
+import { createHash } from "node:crypto";
 import u from "@/utils";
 import { getSettingValue } from "@/utils/cache";
+import appendJsonLine from "@/utils/jsonl";
+import { computeCost } from "@/utils/priceTable";
 
 type AiType =
   | "universalAi"
@@ -368,53 +371,83 @@ class AiText {
   }
 
   /**
-   * 4B 结构化日志：统一 JSON 格式（event:"aiCall"，logger 劫持 console 写 app.log 可检索对账）——
-   * 记录 agentKey/status/延迟/token（invoke 有 usage 时）。审计遗留：LLM 调用层原无可观测性埋点。
+   * 4B 结构化日志：统一 JSON 格式（event:"aiCall"）——console 走 logger 劫持写 app.log，
+   * 同时 JSONL 直写 data/logs/ai-call.jsonl（logger 未启用也可 jq 检索对账，WP2 可追溯）。
+   * 记录 agentKey/status/延迟/prompt 指纹/token（invoke 有 usage 时）。
    */
   private logAiCall(status: "ok" | "fail", startMs: number, extra: Record<string, unknown> = {}) {
-    console.log(JSON.stringify({ event: "aiCall", agentKey: this.AiType, status, durationMs: Date.now() - startMs, ...extra, ts: Date.now() }));
+    const record = { event: "aiCall", agentKey: this.AiType, status, durationMs: Date.now() - startMs, ...extra, ts: Date.now() };
+    appendJsonLine("ai-call.jsonl", record);
+    console.log(JSON.stringify(record));
   }
 
   async invoke(input: Omit<Parameters<typeof generateText>[0], "model">) {
     const startMs = Date.now();
+    const promptTag = promptHashOf((input as Record<string, unknown>).prompt);
+    let usedModel: `${string}:${string}` | null = null;
     try {
       const res = await this.withFailover(async (modelName) => {
+        usedModel = modelName;
         return generateText((await this.buildTextOptions(input as Record<string, unknown>, modelName, { stream: false })) as Parameters<typeof generateText>[0]);
       });
       const usage = toTokenUsage((res as { usage?: unknown })?.usage);
-      this.logAiCall("ok", startMs, usage?.totalTokens != null ? { tokens: usage.totalTokens } : {});
-      if (this.taskRecord) await this.taskRecord(1, undefined, usage);
+      const cost = settleCost(usedModel, usage);
+      this.logAiCall("ok", startMs, { ...promptTag, ...(usage?.totalTokens != null ? { tokens: usage.totalTokens } : {}), ...(cost != null ? { cost } : {}) });
+      if (this.taskRecord) await this.taskRecord(1, undefined, { ...usage, ...(cost != null ? { cost } : {}), ...promptTag });
       return res;
     } catch (e) {
-      this.logAiCall("fail", startMs, { error: u.error(e).message });
+      this.logAiCall("fail", startMs, { error: u.error(e).message, ...promptTag });
       if (this.taskRecord) await this.taskRecord(-1, u.error(e).message);
       throw e;
     }
   }
   async stream(input: Omit<Parameters<typeof streamText>[0], "model">) {
     const startMs = Date.now();
+    const promptTag = promptHashOf((input as Record<string, unknown>).prompt);
+    let usedModel: `${string}:${string}` | null = null;
     try {
       const res = await this.withFailover(async (modelName) => {
+        usedModel = modelName;
         return streamText((await this.buildTextOptions(input as Record<string, unknown>, modelName, { stream: true })) as Parameters<typeof streamText>[0]);
       });
-      this.logAiCall("ok", startMs);
+      this.logAiCall("ok", startMs, promptTag);
       // streamText 的 usage 是 Promise，流被消费完才 resolve；失败/中断静默（不阻断主流程）
       const tr = this.taskRecord;
       if (tr) {
         const usagePromise = (res as { usage?: PromiseLike<unknown> }).usage;
         if (usagePromise) {
           Promise.resolve(usagePromise)
-            .then((usage) => tr(1, undefined, toTokenUsage(usage)))
+            .then((rawUsage) => {
+              const usage = toTokenUsage(rawUsage);
+              const cost = settleCost(usedModel, usage);
+              return tr(1, undefined, { ...usage, ...(cost != null ? { cost } : {}), ...promptTag });
+            })
             .catch(() => {});
         }
       }
       return res;
     } catch (e) {
-      this.logAiCall("fail", startMs, { error: u.error(e).message });
+      this.logAiCall("fail", startMs, { error: u.error(e).message, ...promptTag });
       if (this.taskRecord) await this.taskRecord(-1, u.error(e).message);
       throw e;
     }
   }
+}
+
+/** prompt 指纹（WP2 可追溯）：sha256 前 12 位，回答「这次调用喂了什么」；非字符串 prompt（多消息体）不打指纹 */
+export function promptHashOf(prompt: unknown): { promptHash?: string } {
+  if (typeof prompt !== "string" || !prompt) return {};
+  return { promptHash: createHash("sha256").update(prompt).digest("hex").slice(0, 12) };
+}
+
+/**
+ * 成本结算（WP6 收口修正）：按**实际解析出的模型名**（"vendorId:modelName"）查价表——
+ * o_tasks.model 存的是 agent key（如 novelAgent:chapterAgent），按它查价永远落空；
+ * 故在 AiText 层捕获 failover 后的真实模型名，价目未登记时返回 undefined（cost 保持 NULL 不估算）。
+ */
+function settleCost(model: `${string}:${string}` | null | undefined, usage: { promptTokens?: number; completionTokens?: number } | undefined): number | undefined {
+  if (!model || !usage) return undefined;
+  return computeCost(model, usage.promptTokens, usage.completionTokens);
 }
 
 function referenceList2imageBase642(id: string, input: any) {
