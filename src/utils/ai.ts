@@ -319,13 +319,26 @@ class AiText {
   }
 
   /**
-   * 3A：读 failover 备用模型（o_setting.textFallbackModel，格式 "vendorId:modelName"；空/未配置 = 不启用）。
-   * 主模型调用失败时切换备用重跑一次（U3 兜底：备用也失败才抛带双错误信息的异常）。
+   * 3A：读 failover 备用模型（o_setting.textFallbackModel）。三种取值：
+   * - "vendor:model"：写死的备用（存量兼容）
+   * - "auto"：动态解析——同 vendor 名册内与主模型不同名、非 disabled 的第一档（名册刷新后自动跟随，
+   *   防写死名被 API 名册淘汰后 failover 整体失效——2026-10-14 实证 v4.1-flash 过期 400）
+   * - 空/未配置：不启用 failover。主模型调用失败时切换备用重跑一次（U3 兜底：备用也失败才抛双错误）。
    */
   private async getFallbackModelName(): Promise<`${string}:${string}` | null> {
     try {
       const v = await getSettingValue("textFallbackModel");
-      return v?.trim() ? (v.trim() as `${string}:${string}`) : null;
+      const raw = v?.trim() ?? "";
+      if (!raw) return null;
+      if (raw !== "auto") return raw as `${string}:${string}`;
+      const [vendorId] = this.AiType.split(/:(.+)/);
+      const list = (await u.vendor.getModelList(vendorId)) as Array<{ modelName?: string }>;
+      const primary = await resolveModelName(this.AiType);
+      const primaryName = String(primary).split(/:(.+)/)[1];
+      const alt =
+        list.find((m) => m.modelName && m.modelName !== primaryName && /flash/i.test(m.modelName)) ??
+        list.find((m) => m.modelName && m.modelName !== primaryName);
+      return alt ? (`${vendorId}:${alt.modelName}` as `${string}:${string}`) : null;
     } catch {
       return null;
     }

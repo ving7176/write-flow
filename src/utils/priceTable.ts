@@ -13,9 +13,10 @@ const PRICE_TABLE = new Map<string, { input: number; output: number }>();
 PRICE_TABLE.set("mimo-v2.6-flash", { input: 1, output: 2 }); // ¥1 / ¥2 每百万 tokens
 PRICE_TABLE.set("mimo-v2.6-pro", { input: 3, output: 6 }); // ¥3 / ¥6 每百万 tokens
 // DeepSeek：来源 api-docs.deepseek.com/zh-cn/quick_start/pricing（2026-09-29 查证，空闲时段价）
-// 注意：高峰时段（周一至五 9-12/14-18 点）翻倍；旧名 deepseek-v4-flash 已由 V4.1-Flash 接管计费
-PRICE_TABLE.set("deepseek-v4.1-flash", { input: 1, output: 4 }); // ¥1 / ¥4 每百万 tokens（空闲）
-PRICE_TABLE.set("deepseek-flash", { input: 1, output: 4 }); // 同上别名
+// 注意：高峰时段（周一至五 9-12/14-18 点）翻倍；在售名册 deepseek-flash / deepseek-v4-pro
+// （2026-10-14 实测 400 回执 supported 列表；deepseek-v4.1-flash 旧名调用已 400 拒绝）
+PRICE_TABLE.set("deepseek-flash", { input: 1, output: 4 }); // ¥1 / ¥4 每百万 tokens（空闲）
+PRICE_TABLE.set("deepseek-v4.1-flash", { input: 1, output: 4 }); // 旧名别名（存量 o_tasks 记录对账用）
 
 /** 登记价目（运维/测试注入口；modelName 为 "vendorId:modelName" 的冒号后段；改价须 CHANGELOG 记来源与日期） */
 export function registerPrice(modelName: string, input: number, output: number): void {

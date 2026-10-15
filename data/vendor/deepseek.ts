@@ -144,6 +144,9 @@ const vendor: VendorConfig = {
   models: [
     { name: "DeepSeek V4 Pro", modelName: "deepseek-v4-pro", type: "text", think: true },
     { name: "DeepSeek V4.1 Flash", modelName: "deepseek-v4.1-flash", type: "text", think: true },
+    // 2026-10-14 API 端名册更新（实测 400 回执：supported = deepseek-flash, deepseek-v4-pro）：
+    // deepseek-v4.1-flash 已由 deepseek-flash 接管计费；保留旧行仅供存量路由，新增现行名供 failover
+    { name: "DeepSeek Flash", modelName: "deepseek-flash", type: "text", think: true },
   ],
 };
 

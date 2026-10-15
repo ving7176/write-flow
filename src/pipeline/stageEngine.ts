@@ -49,6 +49,39 @@ export function buildGateRepairPrompt(stageName: string, checkReport: StageCheck
   return `你上一版「${stageName}」产物质检未达标（评级 ${checkReport.rating ?? "未知"}）${block}。请严格按既定 XML 标签格式重新输出本阶段产物，修复上述问题，只输出标签内容本身，不要附加任何解释或 Markdown 代码块。`;
 }
 
+// ── 批次断点凭证（generation.batchProgress）：driver 批量连写的进度/熔断账本 ──
+// 服务端在章节完成/字数拒收时经 generation 串行队列合并写（真实章号）；batchId 由 driver 经
+// chat 内容「批次 <id>」标记透传（novel beforeRunStage 提取），未标记时沿用上一个 batchId。
+
+export interface BatchProgress {
+  /** 产生本凭证的连写批次 id（driver 生成；无标记的对话写入沿用旧值） */
+  batchId?: string;
+  /** 已完成章号（去重追加；失败清零 streak 的语义见 applyBatchProgress） */
+  chaptersDone: number[];
+  /** 连续失败章数（成功一章即清零） */
+  failedStreak: number;
+  updatedAt: number;
+}
+
+/** 连续失败熔断阈值（driver 侧同值镜像：scripts/driver-batch-write.ts BATCH_FAIL_STREAK_LIMIT） */
+export const BATCH_FAIL_STREAK_LIMIT = 3;
+
+/** 批次凭证合并（纯函数，可单测）：chapterDone 追加去重并清零失败计数；failed 累加失败计数 */
+export function applyBatchProgress(
+  prev: BatchProgress | undefined,
+  patch: { batchId?: string; chapterDone?: number; failed?: boolean },
+  now = Date.now(),
+): BatchProgress {
+  const chaptersDone = Array.isArray(prev?.chaptersDone) ? [...prev!.chaptersDone] : [];
+  if (patch.chapterDone != null && !chaptersDone.includes(patch.chapterDone)) chaptersDone.push(patch.chapterDone);
+  const failedStreak = patch.failed
+    ? (prev?.failedStreak ?? 0) + 1
+    : patch.chapterDone != null
+      ? 0
+      : (prev?.failedStreak ?? 0);
+  return { batchId: patch.batchId ?? prev?.batchId, chaptersDone, failedStreak, updatedAt: now };
+}
+
 /**
  * 小说创作确定性编排公共引擎。
  *
@@ -154,6 +187,12 @@ export interface StageHooks {
   ) => Promise<{ raw: string; parsed?: unknown; error?: string } | void>;
   /** 阶段落库后（novel: brief 自动立项） */
   onStagePersisted?: (projectId: number, stageKey: string) => Promise<void>;
+  /**
+   * 章节号漂移闸（novel）：chapter 阶段落库前提供本轮期望章号（max+1）。consume 的章名修订匹配
+   * 命中 ≠ 期望章号的旧章时不覆盖（模型标题漂移会把新稿 upsert 进旧章、毁掉已过闸好稿——
+   * 2026-10-13/14 实证 222/223/224 三度被漂移稿覆盖），改按期望章号落新章。不实现（drama/script）则行为不变。
+   */
+  expectedChapterNo?: (projectId: number) => Promise<number | undefined>;
   /**
    * chapter/episode 阶段重复执行询问（novel: 单次对话连续写多章——shouldRepeatStage 返回 true 则不推进阶段索引，
    * 重跑本阶段生成下一章，配合 beforeRunStage 的 chapterTarget/chapterGenerated 会话计数）。drama/script 不实现则循环行为不变
@@ -464,12 +503,14 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
   function clearPendingReview(pid: number): Promise<void> {
     return queueGenerationMeta(pid, (gen) => ({ ...gen, pendingReview: null })).then(() => undefined);
   }
-  /** B2 think 升级计数：同章字数拒收累计（队列内读改写，避免与 pendingReview/运行位互相覆盖——直写事故实测） */
+  /** B2 think 升级计数：同章字数拒收累计（队列内读改写，避免与 pendingReview/运行位互相覆盖——直写事故实测）。
+   *  transforms 变换账本（进展凭证）随行保留不清——由咽喉点追加、clearWordRetry 整体清 */
   function bumpWordRetry(pid: number, chapterIndex: number): Promise<number> {
     return queueGenerationMeta(pid, (gen) => {
-      const prev = gen.wordRetry as { chapterIndex?: number; count?: number } | undefined;
+      const prev = gen.wordRetry as { chapterIndex?: number; count?: number; transforms?: Array<{ type: string; fromVis: number; toVis: number; at: number }> } | undefined;
       const count = prev && prev.chapterIndex === chapterIndex ? (prev.count ?? 0) + 1 : 1;
-      gen.wordRetry = { chapterIndex, count };
+      const transforms = prev && prev.chapterIndex === chapterIndex ? (prev.transforms ?? []) : [];
+      gen.wordRetry = { chapterIndex, count, transforms: transforms.slice(-12) };
       return { ...gen, wordRetry: gen.wordRetry };
     }).then(() => {
       // 队列外重读拿最终 count（队列串行，此时必为最新）
@@ -481,6 +522,13 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
   }
   function clearWordRetry(pid: number): Promise<void> {
     return queueGenerationMeta(pid, (gen) => ({ ...gen, wordRetry: null })).then(() => undefined);
+  }
+  /** 批次断点凭证写（合并写，不清运行位/wordRetry/pendingReview）：novel afterSubAgent 完成/拒收时调用 */
+  function markBatchProgress(pid: number, patch: { batchId?: string; chapterDone?: number; failed?: boolean }): Promise<void> {
+    return queueGenerationMeta(pid, (gen) => ({
+      ...gen,
+      batchProgress: applyBatchProgress(gen.batchProgress as BatchProgress | undefined, patch),
+    })).then(() => undefined);
   }
 
   /**
@@ -588,13 +636,13 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
    * - 缺省复用 consumeAgentOutput 完整消费链路（标签提取/JSON 解析/schema 校验/落库/章节或剧本同步）
    * 阶段消费校验：chapter 阶段看 chapterItem 计数、episode 阶段看 scriptItem 计数、单字段看 consumed。
    */
-  async function persistStage(projectId: number, stageKey: string, fullResponse: string): Promise<StagePersistResult> {
+  async function persistStage(projectId: number, stageKey: string, fullResponse: string, opts?: { expectedChapterNo?: number }): Promise<StagePersistResult> {
     const def = defs.find((s) => s.stageKey === stageKey);
     if (registry.persistStage) {
       return registry.persistStage(projectId, stageKey, fullResponse, def);
     }
     try {
-      const res = await consumeAgentOutput(agentKey, projectId, fullResponse);
+      const res = await consumeAgentOutput(agentKey, projectId, fullResponse, opts);
       if (def?.chapter) {
         if (res.chapters === 0) {
           return { ...res, chapterCount: res.chapters, scriptCount: 0, error: "章节产物消费失败：未解析到有效 <chapterItem>（产物为空或格式错误）", retryable: true };
@@ -624,14 +672,21 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
    * 2C：格式错自动重试（U5 兜底：只对 ConsumeError/标签缺失重试，空输出与其他错误不重试）。
    * persistStage 返回 retryable=true 时，回灌具体错误（缺哪个标签）给子 Agent 重生成一次；
    * 重生成仍失败 → 保留错误交人工 redo。成功则返回修复稿，落库的始终是最新可解析产物。
+   * 2C 旁路封洞：重试产物在落库前补跑与 runStageDirect 相同的 afterSubAgent 字数闸——
+   * 此处原先直接 persistStage，重生成产物绕过 B2 硬闸（2026-10-02 220 实证 531/1628 字残稿两度漏网）；
+   * 闸不过走既有拒收语义（error 上抛 fail stage，不静默落库），闸返回覆盖稿则落库覆盖稿。
    */
   async function persistWithRetryOnConsumeError(
+    ctx: AgentContext,
     projectId: number,
     stageKey: string,
     raw: string,
     deps: { stageTools: StageToolMap },
   ): Promise<{ persisted: StagePersistResult; raw: string }> {
-    const persisted = await persistStage(projectId, stageKey, raw);
+    const def = defs.find((d) => d.stageKey === stageKey);
+    // 章节号漂移闸：期望章号只对 chapter 阶段取（落库前现算 max+1，与阶段期基线一致）
+    const expectedChapterNo = def?.chapter ? await hooks?.expectedChapterNo?.(projectId).catch(() => undefined) : undefined;
+    const persisted = await persistStage(projectId, stageKey, raw, { expectedChapterNo });
     if (!persisted.error || !persisted.retryable) return { persisted, raw };
     const stageTool = deps.stageTools[stageKey];
     if (!stageTool?.execute) return { persisted, raw };
@@ -645,9 +700,26 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
       const retryRaw = typeof retryResp === "string" ? retryResp : (retryResp as { raw?: unknown })?.raw;
       const retryStr = typeof retryRaw === "string" ? retryRaw : "";
       if (!retryStr) return { persisted, raw }; // 重生成无效（空）→ 保留原错误
-      const persisted2 = await persistStage(projectId, stageKey, retryStr);
+      // 2C 旁路封洞：重试产物过 afterSubAgent 字数闸（语义对齐 runStageDirect 闸后路径：
+      // error → 拒收不落库，retryable 只留 [GATE2]；返回覆盖稿（自动修复）→ 以覆盖稿落库）
+      let gatedRaw = retryStr;
+      let gatedParsed: unknown = retryResp && typeof retryResp === "object" ? (retryResp as { parsed?: unknown }).parsed : undefined;
+      const afterResp = await hooks?.afterSubAgent?.(ctx, stageKey, { raw: gatedRaw, parsed: gatedParsed }, deps.stageTools);
+      if (afterResp && (afterResp as { error?: string }).error) {
+        const afterErr = String((afterResp as { error?: string }).error);
+        console.warn(`[${agentKey}] 阶段「${stageKey}」格式错重试产物未过 afterSubAgent 闸，拒收不落库: ${afterErr}`);
+        return {
+          persisted: { consumed: [], chapterCount: 0, scriptCount: 0, error: afterErr, retryable: afterErr.startsWith("[GATE2]") },
+          raw: "",
+        };
+      }
+      if (afterResp && typeof afterResp.raw === "string" && afterResp.raw) {
+        gatedRaw = afterResp.raw;
+        gatedParsed = afterResp.parsed;
+      }
+      const persisted2 = await persistStage(projectId, stageKey, gatedRaw, { expectedChapterNo });
       if (!persisted2.error) console.warn(`[${agentKey}] 阶段「${stageKey}」格式错自动重试成功（一次）`);
-      return { persisted: persisted2, raw: retryStr };
+      return { persisted: persisted2, raw: gatedRaw };
     } catch (e) {
       return { persisted, raw }; // 重生成异常 → 保留原错误
     }
@@ -838,7 +910,7 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
     // 2C：格式错自动重试一次（回灌错误重生成，成功则用修复稿继续）
     let persisted: StagePersistResult | null = null;
     if (!gateBlocked) {
-      const persistRes = await persistWithRetryOnConsumeError(projectId, stage.stageKey, resp.raw, deps);
+      const persistRes = await persistWithRetryOnConsumeError(ctx, projectId, stage.stageKey, resp.raw, deps);
       persisted = persistRes.persisted;
       if (persisted.error) {
         await trace.fail({ detail: persisted.error, retryCount });
@@ -1006,7 +1078,7 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
         }
         // confirm：P1c 门禁稿接受 → 补落库（C/D 此前未落正式位置，避免垃圾数据残留；落库失败尽力记录不阻断）
         if (v.blocked && !v.persisted) {
-          const gatePersist = await persistWithRetryOnConsumeError(projectId, stage.stageKey, v.raw, deps);
+          const gatePersist = await persistWithRetryOnConsumeError(ctx, projectId, stage.stageKey, v.raw, deps);
           if (gatePersist.persisted.error) {
             console.warn(`[${agentKey}] 阶段「${stage.name}」确认补落库失败:`, gatePersist.persisted.error);
           } else {
@@ -1067,7 +1139,7 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
         const resp = await runStageWithGate2Retry(ctx, def.stageKey, prompt ?? "", deps);
         if (resp.error) return { ok: false, error: resp.error };
         // 2C：格式错自动重试（复用 runWorkflow 同一条重试路径）
-        const persistRes = await persistWithRetryOnConsumeError(projectId, def.stageKey, resp.raw, deps);
+        const persistRes = await persistWithRetryOnConsumeError(ctx, projectId, def.stageKey, resp.raw, deps);
         const persisted = persistRes.persisted;
         if (persisted.error) return { ok: false, error: persisted.error };
         // 返回产物摘要（截断）：决策层据此做完整性检查 + 一句话质量小结（semi/manual 确认点交互）
@@ -1119,5 +1191,17 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
     });
   }
 
-  return { runWorkflow, runStageDirect, persistStage, runSupervision, makeWorkflowStageTool, makeStageCheckTool, getWorkData, genMeta: { markPendingReview, clearPendingReview, bumpWordRetry, clearWordRetry } };
+  /** B2b 变换账本追加（进展凭证，A8）：字数闸咽喉点每次实际执行变换后记录（类型/前后字数），
+   *  咽喉点据此跳过「同基底±50 字内同类型」的重复变换——无进展不重试，有界退出交人工 */
+  function recordWordTransform(pid: number, chapterIndex: number, entry: { type: string; fromVis: number; toVis: number }): Promise<void> {
+    return queueGenerationMeta(pid, (gen) => {
+      const prev = gen.wordRetry as { chapterIndex?: number; count?: number; transforms?: Array<{ type: string; fromVis: number; toVis: number; at: number }> } | undefined;
+      const transforms = prev && prev.chapterIndex === chapterIndex ? [...(prev.transforms ?? [])] : [];
+      transforms.push({ type: entry.type, fromVis: entry.fromVis, toVis: entry.toVis, at: Date.now() });
+      const wordRetry = { chapterIndex, count: prev && prev.chapterIndex === chapterIndex ? (prev.count ?? 0) : 1, transforms: transforms.slice(-12) };
+      return { ...gen, wordRetry };
+    }).then(() => undefined);
+  }
+
+  return { runWorkflow, runStageDirect, persistStage, runSupervision, makeWorkflowStageTool, makeStageCheckTool, getWorkData, genMeta: { markPendingReview, clearPendingReview, bumpWordRetry, clearWordRetry, markBatchProgress, recordWordTransform } };
 }

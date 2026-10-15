@@ -8,6 +8,31 @@ import { parseOutlineForeshadows } from "@/agents/novelAgent/foreshadowParse";
 import { mergeOutlineMarkdown, hasParseableChapterHeading, syncOutlineStructure, markChapterWrittenLight, recomputeVolumeStatus, notePendingVolumeDone } from "@/agents/novelAgent/outlinePlan";
 import { nextChapterNo } from "@/agents/novelAgent/workflow";
 import { recordTrace } from "@/pipeline/trace";
+import appendJsonLine from "@/utils/jsonl";
+
+// ── 章写入探针 + 全局写锁（幽灵写入取证/防并发交错覆盖，2026-10-15）──
+
+/** 章写入轨迹（JSONL 旁路日志）：每行可完整还原一次 o_novel 写入/覆盖/删除的归属与前后状态 */
+function traceChapterWrite(entry: Record<string, unknown>): void {
+  appendJsonLine("chapter-write-trace.jsonl", { ts: Date.now(), ...entry });
+}
+
+/** 可见字符数（与 chapterWords/chapterTrim 同口径） */
+function visOfText(text: string): number {
+  return Array.from((text ?? "").replace(/\s+/g, "")).length;
+}
+
+/** 章写入全局互斥链：同进程内所有 o_novel 章写严格串行（异常透传且不断链）。
+ *  章写低频（每链一章），全局锁粒度足够；并发双链写同章在此天然排队，杜绝交错覆盖 */
+const chapterWriteChain: { promise: Promise<void> } = { promise: Promise.resolve() };
+function withChapterWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = chapterWriteChain.promise.then(fn, fn);
+  chapterWriteChain.promise = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
 
 /**
  * 产物消费网关错误：xmlConsume 收到非空输出但无法解析出任何已知标签时抛出。
@@ -197,6 +222,7 @@ export async function consumeAgentOutput(
   agentKey: string,
   projectId: number,
   xml: string,
+  opts?: { expectedChapterNo?: number },
 ): Promise<{ consumed: string[]; chapters: number }> {
   const result = { consumed: [] as string[], chapters: 0 };
   if (!xml?.trim()) return result;
@@ -445,12 +471,18 @@ export async function consumeAgentOutput(
       // - 落库标题以章卡 title 为唯一真相源（大纲层真相）；无章卡时剥离「第N章 ·」序号前缀兜底
       // - 模型标题与裁定值不一致 → recordTrace 留痕观测（漂移率监控），不阻断
       const key = chapterKey(chapter);
+      // 章写入全程全局互斥（含查重→快照→upsert），杜绝并发双链交错覆盖（幽灵写入取证中）
+      await withChapterWriteLock(async () => {
       // 查全部已有章键做同章匹配（修订版后缀变化也能命中：如「第1章·下山」vs「第1章·下山（修订）」）
       // 性能：只取轻量列做去重（不拖 chapterData 全文——长篇几百章每章写前整本搬正文是最大 DB 热点）
       const rows = await u.db("o_novel").where("projectId", projectId).select("id", "chapterIndex", "chapter");
       const dup = (rows as any[]).find((r) => chapterKey(r.chapter) === key);
-      // index：修订覆盖命中时取既有章号，新章取 max+1（而非 count 总行数——删除章节后 count 与 index 错位，导致覆盖/跳号）
-      const index = dup ? dup.chapterIndex : await nextChapterNo(projectId);
+      // 章号漂移闸（expectedChapterNo）：批次续写时模型标题漂移会命中旧章键并 upsert 覆盖已过闸好稿
+      // （2026-10-13/14 实证 222/223/224 三度被漂移稿覆盖）——修订覆盖只认「同期望章号」的命中；
+      // 命中其他章号视为漂移，按期望章号落新章。expected 未提供（工作台修订等旧路径）行为不变。
+      const revisionMatch = dup != null && (opts?.expectedChapterNo == null || dup.chapterIndex === opts.expectedChapterNo);
+      // index：修订覆盖命中时取既有章号，新章取期望章号（未提供则 max+1——而非 count 总行数，删章后 count 与 index 错位）
+      const index = revisionMatch ? dup!.chapterIndex : opts?.expectedChapterNo ?? await nextChapterNo(projectId);
       const planTitle = await getChapterPlanTitle(projectId, index);
       const stripped = stripChapterNoPrefix(chapter);
       const finalChapter = planTitle || stripped || chapter;
@@ -465,7 +497,7 @@ export async function consumeAgentOutput(
           detail: `[章名漂移] 模型输出「${chapter}」与裁定章名「${resolvedName}」不一致，已按章卡/剥前缀裁定落库`,
         }).catch(() => {});
       }
-      if (dup) {
+      if (revisionMatch && dup) {
         // P1-2：覆盖前存旧稿快照（历史版本回滚；覆盖普通生成 + 监督返工稿，两路径都经 consumeAgentOutput 落库）
         // 性能（B3）：查重行不含 chapterData，快照用旧稿需单独取一次（仅修订覆盖时）
         const oldData = (await u.db("o_novel").where({ id: dup.id }).select("chapterData").first()) as { chapterData?: string } | undefined;
@@ -482,7 +514,8 @@ export async function consumeAgentOutput(
         const vid = await markChapterWrittenLight(projectId, dup.chapterIndex, dup.id);
         if (vid != null) touchedVolumes.add(vid);
         result.chapters++;
-        continue;
+        traceChapterWrite({ projectId, chapterIndex: dup.chapterIndex, action: "revision", vis: visOfText(content), prevVis: visOfText(oldData?.chapterData ?? ""), expectedChapterNo: opts?.expectedChapterNo ?? null });
+        return;
       }
       // R6 章名-索引错位观测（软告警不阻断）：模型章名自带序号与实际落库 index 不一致 → 记 trace 供
       // 内容质量监控。E2E 实测样本：AI 合并大纲两段剧情并自称「第2章」，DB index=1 自洽但读者视角错位。
@@ -502,6 +535,8 @@ export async function consumeAgentOutput(
       const vid = await markChapterWrittenLight(projectId, index, novelId);
       if (vid != null) touchedVolumes.add(vid);
       result.chapters++;
+      traceChapterWrite({ projectId, chapterIndex: index, action: "insert-or-update", vis: visOfText(content), expectedChapterNo: opts?.expectedChapterNo ?? null, matchedOldChapter: dup ? dup.chapterIndex : null });
+      });
     }
     // 批量路径（B7）：统一重算受影响卷状态 + 卷写完事件（原逐章级联 4-7 次/章 → 一次批量重算）
     if (touchedVolumes.size) {

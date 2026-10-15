@@ -13,7 +13,7 @@ import u from "@/utils";
  * - source 标识覆盖来源：regen=重新生成 / supervision=监督返工 / manual=手动编辑
  */
 
-export type ChapterSnapshotSource = "regen" | "supervision" | "manual" | "deleted" | "aiEdit";
+export type ChapterSnapshotSource = "regen" | "supervision" | "manual" | "deleted" | "aiEdit" | "rejected";
 
 export interface ChapterSnapshotInput {
   projectId: number;
