@@ -10,6 +10,7 @@
 
 import type { NumericViolation } from "@/pipeline/constraintChecker";
 import { verifyConstraintRefs } from "@/pipeline/constraintChecker";
+import appendJsonLine from "@/utils/jsonl";
 
 /** hard 红线类型（命中即触发自动重生成） */
 export const HARD_REDLINE_TYPES = new Set(["LOGIC", "ABILITY", "KNOWLEDGE", "ERA", "NUMERIC"]);
@@ -435,6 +436,8 @@ export async function autoRepairChapter(
     }
     if (!report) {
       // 重试后仍解析失败：降级不返工，2D：显式上报降级
+      // HP-修复（2026-10-15）：raw 落盘留痕——解析失败无尸可检导致格式方差无法定位（supervisionAgent=deepseek-flash 当日 3 次降级）
+      appendJsonLine("supervision-raw.jsonl", { src: "supervision", level: "warn", msg: "parse_failed", len: reportRaw.length, head: reportRaw.slice(0, 800) });
       onDegrade?.("监督报告解析失败（重试后仍未产出 <supervisionReport>）");
       return degradedReturn();
     }

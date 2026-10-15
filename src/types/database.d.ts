@@ -1,4 +1,4 @@
-// @db-hash 06eac74af6058cdbde7fca1369d1d862
+// @db-hash 68baca58511815fae23851935ec670a9
 //该文件由脚本自动生成，请勿手动修改
 
 export interface memories {
@@ -110,11 +110,14 @@ export interface o_chatHistory {
   'agentKey': string;
   'content': string;
   'createTime': number;
+  'eventType'?: string | null;
   'id': string;
   'name'?: string | null;
+  'payload'?: string | null;
   'projectId'?: number | null;
   'role'?: string | null;
   'stageKey'?: string | null;
+  'version'?: number | null;
 }
 export interface o_check_report {
   'chapterIndex'?: number | null;
