@@ -171,6 +171,8 @@ export interface RepairStageTools {
   };
   /** B2：章节字数下限（供 best 择优与 continue 式返工判定；缺省用 WORD_TARGET） */
   chapterWordMin?: number;
+  /** SP1：监督解析失败的重试阈值（ms）——首胜耗时低于该值（网络/立败类）才重试一次；缺省 20s */
+  parseRetryFastMs?: number;
 }
 
 export interface RepairResult {
@@ -369,6 +371,8 @@ export async function autoRepairChapter(
   let attempts = 0;
   // 章节字数下限（B2 硬闸：不足不许通过，永不入库；continue 式返工补足）
   const wordMin = stageTools.chapterWordMin ?? WORD_TARGET;
+  // SP1：解析失败重试的快速失败阈值（ms）；首胜耗时低于它才重试（网络/立败类），限时打满直落降级
+  const parseRetryFastMs = stageTools.parseRetryFastMs ?? 20_000;
   const wordOkOf = (content: string): boolean => {
     const n = (content ?? "").replace(/\s+/g, "").length;
     return n >= wordMin;
@@ -406,6 +410,7 @@ export async function autoRepairChapter(
     // 1. 监督审核当前稿
     let report: SupervisionReport | null = null;
     let reportRaw = "";
+    const supStart = Date.now();
     try {
       const supResp = await stageTools.run_sub_agent_supervision.execute?.(
         { prompt: buildSupervisionPrompt(current) },
@@ -422,16 +427,23 @@ export async function autoRepairChapter(
       return degradedReturn();
     }
     if (!report) {
-      // 报告解析失败：先重试一次监督（MiMo 系输出格式有方差，一次重试消掉大半），再失败才降级
-      console.warn("[novelAgent] 监督报告解析失败，重试一次监督审核");
-      try {
-        const retryResp = await stageTools.run_sub_agent_supervision.execute?.(
-          { prompt: buildSupervisionPrompt(current) },
-          { toolCallId: `stage-chapter-supervision-retry-${attempt}`, messages: [] },
-        );
-        report = parseSupervisionReport(extractRaw(retryResp));
-      } catch (e) {
-        console.warn("[novelAgent] 监督重试仍异常:", e instanceof Error ? e.message : String(e));
+      // SP1（2026-10-15）：仅快速失败（< parseRetryFastMs，网络/立败类）才重试一次；
+      // 限时打满或慢失败直落降级——无差别重试在监督限时下会把等待翻倍（deepseek-flash 当日 3 次降级实证）
+      const supElapsed = Date.now() - supStart;
+      if (supElapsed < parseRetryFastMs) {
+        // 报告解析失败：先重试一次监督（输出格式有方差，一次重试消掉大半），再失败才降级
+        console.warn("[novelAgent] 监督报告解析失败（快速失败），重试一次监督审核");
+        try {
+          const retryResp = await stageTools.run_sub_agent_supervision.execute?.(
+            { prompt: buildSupervisionPrompt(current) },
+            { toolCallId: `stage-chapter-supervision-retry-${attempt}`, messages: [] },
+          );
+          report = parseSupervisionReport(extractRaw(retryResp));
+        } catch (e) {
+          console.warn("[novelAgent] 监督重试仍异常:", e instanceof Error ? e.message : String(e));
+        }
+      } else {
+        console.warn(`[novelAgent] 监督报告解析失败且耗时 ${supElapsed}ms 超快速失败阈值，不重试直落降级`);
       }
     }
     if (!report) {
