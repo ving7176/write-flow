@@ -2,7 +2,8 @@ import u from "@/utils";
 import { singleFieldStageKeys, stageXmlTag, validateStageOutput, validateBriefJsonOutput } from "@/pipeline/schemas/novel";
 import { parseConstraintsXml, mergeConstraints, type NovelConstraint } from "@/agents/novelAgent/constraints";
 import { chapterKey } from "@/utils/chapterKey";
-import { snapshotChapter } from "@/pipeline/chapterVersion";
+import { snapshotChapter, clearChapterCheckpoints } from "@/pipeline/chapterVersion";
+import { appendAgentEvent } from "@/utils/agentEvent";
 import { textModerate, recordAudit } from "@/utils/contentSafety";
 import { parseOutlineForeshadows } from "@/agents/novelAgent/foreshadowParse";
 import { mergeOutlineMarkdown, hasParseableChapterHeading, syncOutlineStructure, markChapterWrittenLight, recomputeVolumeStatus, notePendingVolumeDone } from "@/agents/novelAgent/outlinePlan";
@@ -473,6 +474,19 @@ export async function consumeAgentOutput(
       const key = chapterKey(chapter);
       // 章写入全程全局互斥（含查重→快照→upsert），杜绝并发双链交错覆盖（幽灵写入取证中）
       await withChapterWriteLock(async () => {
+      // HP2 观察期（chapter_write_suspect）：章写时运行位已关闭 → 疑似迟到 attempt
+      //（withToolTimeout 超时不取消底层，旧 attempt 慢到可覆盖新结果）。只留痕不丢弃，
+      // 观察期零误报后转硬丢弃。已知潜在误报源：confirm 补落库路径若未经 begin 登记。
+      try {
+        const genRow = await u.db("o_agentWorkData").where({ projectId, key: "novelAgent" }).select("data").first();
+        const gen = genRow ? ((JSON.parse((genRow as any).data ?? "{}")?.generation ?? {}) as Record<string, unknown>) : {};
+        if (gen.running === false) {
+          traceChapterWrite({ projectId, chapterIndex: opts?.expectedChapterNo ?? null, action: "chapter_write_after_run_close", suspect: true, attemptId: gen.attemptId ?? null });
+          appendAgentEvent({ projectId, agentKey: "novelAgent", eventType: "chapter_write_suspect", payload: { chapterIndex: opts?.expectedChapterNo ?? null, attemptId: gen.attemptId ?? null } });
+        }
+      } catch {
+        /* 观察失败不阻断章写 */
+      }
       // 查全部已有章键做同章匹配（修订版后缀变化也能命中：如「第1章·下山」vs「第1章·下山（修订）」）
       // 性能：只取轻量列做去重（不拖 chapterData 全文——长篇几百章每章写前整本搬正文是最大 DB 热点）
       const rows = await u.db("o_novel").where("projectId", projectId).select("id", "chapterIndex", "chapter");
@@ -515,6 +529,7 @@ export async function consumeAgentOutput(
         if (vid != null) touchedVolumes.add(vid);
         result.chapters++;
         traceChapterWrite({ projectId, chapterIndex: dup.chapterIndex, action: "revision", vis: visOfText(content), prevVis: visOfText(oldData?.chapterData ?? ""), expectedChapterNo: opts?.expectedChapterNo ?? null });
+        await clearChapterCheckpoints(projectId, dup.chapterIndex); // 落库终态：清半截稿 checkpoint
         return;
       }
       // R6 章名-索引错位观测（软告警不阻断）：模型章名自带序号与实际落库 index 不一致 → 记 trace 供
@@ -536,6 +551,7 @@ export async function consumeAgentOutput(
       if (vid != null) touchedVolumes.add(vid);
       result.chapters++;
       traceChapterWrite({ projectId, chapterIndex: index, action: "insert-or-update", vis: visOfText(content), expectedChapterNo: opts?.expectedChapterNo ?? null, matchedOldChapter: dup ? dup.chapterIndex : null });
+      await clearChapterCheckpoints(projectId, index); // 落库终态：清半截稿 checkpoint
       });
     }
     // 批量路径（B7）：统一重算受影响卷状态 + 卷写完事件（原逐章级联 4-7 次/章 → 一次批量重算）

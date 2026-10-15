@@ -13,7 +13,7 @@ import u from "@/utils";
  * - source 标识覆盖来源：regen=重新生成 / supervision=监督返工 / manual=手动编辑
  */
 
-export type ChapterSnapshotSource = "regen" | "supervision" | "manual" | "deleted" | "aiEdit" | "rejected";
+export type ChapterSnapshotSource = "regen" | "supervision" | "manual" | "deleted" | "aiEdit" | "rejected" | "crash";
 
 export interface ChapterSnapshotInput {
   projectId: number;
@@ -46,5 +46,38 @@ export async function snapshotChapter(input: ChapterSnapshotInput): Promise<numb
   } catch (e) {
     console.warn(`[chapterVersion] 快照写入失败（不阻断）: ${e instanceof Error ? e.message : String(e)}`);
     return null;
+  }
+}
+
+/**
+ * 半截稿流式 checkpoint（HP2 · harness「撕尾抢救」按 qiflow 成本结构的反向改造）：
+ * 章稿落库窗口=整章含全部返工循环（最坏 30 分钟级），崩溃即纯内存丢失——生成流中途
+ * 周期性把半截稿快照到 o_chapter_version（source=crash，novelId=0 与真章版本序列隔离）。
+ * 覆盖语义：同 (projectId, chapterIndex) 只留最新一条 crash 快照（先删后插），防 30 分钟
+ * 生成写爆版本表。失败静默（留痕通道纪律）。
+ */
+export async function checkpointChapterDraft(input: { projectId: number; chapterIndex: number; chapter: string; content: string }): Promise<void> {
+  try {
+    if (Array.from(input.content ?? "").length < 200) return; // 过短不值得快照
+    await u.db("o_chapter_version").where({ projectId: input.projectId, novelId: 0, chapterIndex: input.chapterIndex, source: "crash" }).del();
+    await snapshotChapter({
+      projectId: input.projectId,
+      novelId: 0,
+      chapterIndex: input.chapterIndex,
+      chapter: input.chapter,
+      chapterData: input.content,
+      source: "crash",
+    });
+  } catch (e) {
+    console.warn(`[chapterVersion] 半截稿 checkpoint 失败（不阻断）: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** 清除章的半截稿 checkpoint：正常落库/拒收终态时调用（防残留被误读为未完成稿） */
+export async function clearChapterCheckpoints(projectId: number, chapterIndex: number): Promise<void> {
+  try {
+    await u.db("o_chapter_version").where({ projectId, novelId: 0, chapterIndex, source: "crash" }).del();
+  } catch {
+    /* 清理失败无害（下次 checkpoint 覆盖） */
   }
 }

@@ -124,9 +124,8 @@ async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${strin
   const modelList = await u.vendor.getModelList(id);
   const selectedModel = modelList.find((i: any) => i.modelName == name);
   if (!selectedModel) throw new Error(`未找到模型 ${name} id=${id}`);
-  const code = u.vendor.getCode(id);
-  const jsCode = transform(code, { transforms: ["typescript"] }).code;
-  const running = u.vm(jsCode);
+  // HP6 读穿缓存：编译产物进程内复用（inputValues/models 每次调用重新 assign，配置变更即时生效）
+  const running = u.vendor.getCompiledVendor(id);
   if (running.vendor) {
     Object.assign(running.vendor.inputValues, JSON.parse(vendorConfigData.inputValues ?? "{}"));
     running.vendor.models = modelList;
@@ -335,10 +334,20 @@ class AiText {
       const list = (await u.vendor.getModelList(vendorId)) as Array<{ modelName?: string }>;
       const primary = await resolveModelName(this.AiType);
       const primaryName = String(primary).split(/:(.+)/)[1];
-      const alt =
-        list.find((m) => m.modelName && m.modelName !== primaryName && /flash/i.test(m.modelName)) ??
-        list.find((m) => m.modelName && m.modelName !== primaryName);
-      return alt ? (`${vendorId}:${alt.modelName}` as `${string}:${string}`) : null;
+      const candidates = list.map((m) => m.modelName).filter((n): n is string => !!n && n !== primaryName);
+      // 优先选「远端名册 ∩ 模板清单」的 flash 档——模板清单可能挂着已被 API 淘汰的旧名（v4.1-flash 实证），
+      // 直接从模板选会 400；远端名册拉取失败时回退模板清单逻辑（行为同前）
+      let pool = candidates;
+      try {
+        const { fetchRemoteRoster } = await import("@/utils/modelRoster");
+        const remote = await fetchRemoteRoster(vendorId);
+        if (remote) {
+          const inRoster = candidates.filter((n) => remote.has(n));
+          if (inRoster.length) pool = inRoster;
+        }
+      } catch { /* 名册拉取失败 → 回退模板清单 */ }
+      const alt = pool.find((n) => /flash/i.test(n)) ?? pool[0];
+      return alt ? (`${vendorId}:${alt}` as `${string}:${string}`) : null;
     } catch {
       return null;
     }

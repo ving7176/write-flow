@@ -143,9 +143,9 @@ const vendor: VendorConfig = {
   },
   models: [
     { name: "DeepSeek V4 Pro", modelName: "deepseek-v4-pro", type: "text", think: true },
-    { name: "DeepSeek V4.1 Flash", modelName: "deepseek-v4.1-flash", type: "text", think: true },
     // 2026-10-14 API 端名册更新（实测 400 回执：supported = deepseek-flash, deepseek-v4-pro）：
-    // deepseek-v4.1-flash 已由 deepseek-flash 接管计费；保留旧行仅供存量路由，新增现行名供 failover
+    // deepseek-v4-flash / v4.1-flash 均已下架（10-15 /models 复核仅 2 名），failover 已切 auto 动态解析，
+    // 存量路由由并行会话统一改 deepseek-flash；旧名行删除防 auto/管理端误选
     { name: "DeepSeek Flash", modelName: "deepseek-flash", type: "text", think: true },
   ],
 };

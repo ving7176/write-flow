@@ -1,4 +1,5 @@
 import type { Socket } from "socket.io";
+import { appendAgentEvent } from "@/utils/agentEvent";
 
 /**
  * 人工确认状态机（semi/manual 确认点，novel 线使用）。
@@ -16,12 +17,20 @@ import type { Socket } from "socket.io";
  *   真正中止只发生在 socket 断开（clearStageConfirms）或新指令接管（abortPendingConfirms）
  * - 同 socket 同阶段二次等待（双开 workflow）→ 后来者立即 abort，不再覆盖前者 resolver
  *   （原覆盖会把前者挂死到 30 分钟超时）
+ *
+ * HP1 事件流：确认挂起/裁决入事件流（confirm_wait/confirm_resolve），
+ * ctx.projectId 缺省（headless/测试）时跳过事件。
  */
 
 export type StageConfirmAction = "confirm" | "redo" | "back" | "abort";
 
+/** 待确认项：resolver + 事件流归属（projectId 缺省=不记事件） */
+interface PendingConfirm {
+  resolve: (action: StageConfirmAction) => void;
+  projectId?: number;
+}
 /** 待确认 Promise 表：key = `${socketId}:${stageKey}` */
-const pendingConfirmResolvers = new Map<string, (action: StageConfirmAction) => void>();
+const pendingConfirmResolvers = new Map<string, PendingConfirm>();
 /** P1-5 针对性返工：redo 附带的用户补充要求（key 同上；stageEngine 取出即删，回灌重跑 prompt） */
 const redoNotes = new Map<string, string>();
 
@@ -40,7 +49,10 @@ export function hasPendingConfirm(socketId: string, stageKey: string): boolean {
  * - socket 断开时由 clearStageConfirms 统一 abort
  * - 同 socket 同阶段已有等待中的确认（重复触发 workflow）→ 立即 abort 后来者
  */
-export function waitForStageConfirm(ctx: { socket: Pick<Socket, "id"> & { emit?: (event: string, payload: unknown) => void } }, stageKey: string): Promise<StageConfirmAction> {
+export function waitForStageConfirm(
+  ctx: { socket: Pick<Socket, "id"> & { emit?: (event: string, payload: unknown) => void }; projectId?: number; agentKey?: string },
+  stageKey: string,
+): Promise<StageConfirmAction> {
   const key = confirmKey(ctx.socket.id, stageKey);
   if (pendingConfirmResolvers.has(key)) return Promise.resolve("abort");
   return new Promise((resolve) => {
@@ -52,10 +64,16 @@ export function waitForStageConfirm(ctx: { socket: Pick<Socket, "id"> & { emit?:
         /* emit 失败（headless mock socket）忽略 */
       }
     }, 30 * 60 * 1000);
-    pendingConfirmResolvers.set(key, (action) => {
-      clearTimeout(timer);
-      resolve(action);
+    pendingConfirmResolvers.set(key, {
+      resolve: (action) => {
+        clearTimeout(timer);
+        resolve(action);
+      },
+      projectId: ctx.projectId,
     });
+    if (ctx.projectId != null) {
+      appendAgentEvent({ projectId: ctx.projectId, agentKey: ctx.agentKey ?? "novelAgent", eventType: "confirm_wait", payload: { stageKey } });
+    }
   });
 }
 
@@ -63,7 +81,11 @@ export function waitForStageConfirm(ctx: { socket: Pick<Socket, "id"> & { emit?:
 export function resolveStageConfirm(socketId: string, stageKey: string, action: StageConfirmAction, note?: string): void {
   const key = confirmKey(socketId, stageKey);
   if (action === "redo" && note?.trim()) redoNotes.set(key, note.trim());
-  pendingConfirmResolvers.get(key)?.(action);
+  const pending = pendingConfirmResolvers.get(key);
+  pending?.resolve(action);
+  if (pending?.projectId != null) {
+    appendAgentEvent({ projectId: pending.projectId, agentKey: "novelAgent", eventType: "confirm_resolve", payload: { stageKey, decision: action, hasNote: !!note?.trim() } });
+  }
   pendingConfirmResolvers.delete(key);
 }
 
@@ -78,9 +100,9 @@ export function takeRedoNote(socketId: string, stageKey: string): string | undef
 /** 中止该连接所有等待中的确认（新 chat/stageGenerate 接管时调用；返回中止数量） */
 export function abortPendingConfirms(socketId: string): number {
   let n = 0;
-  for (const [key, resolve] of pendingConfirmResolvers) {
+  for (const [key, pending] of pendingConfirmResolvers) {
     if (key.startsWith(`${socketId}:`)) {
-      resolve("abort");
+      pending.resolve("abort");
       pendingConfirmResolvers.delete(key);
       n++;
     }

@@ -47,6 +47,7 @@ const MANIFEST: string[] = [
   "utils/agent/embedding.ts",
   "utils/agent/memory.ts",
   "utils/ai.ts",
+  "utils/modelRoster.ts",
   "utils/agentEvent.ts",
   "utils/cache.ts",
   "utils/chapterKey.ts",

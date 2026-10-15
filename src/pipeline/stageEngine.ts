@@ -18,6 +18,7 @@ import { createWfLoop, decideConfirm, evalSchemaValid, hasCheckReport } from "@/
 import type { ScanIssue } from "@/agents/novelAgent/supervision";
 import path from "path";
 import fs from "fs";
+import { appendAgentEvent } from "@/utils/agentEvent";
 
 /** 4B：工具级超时（LLM 调用层 90s，工具含生成+解析给 180s 余量）。
  *  chapter 阶段例外：execute 含生成(480s think)+监督(×4)+返工(≤3 轮)全闭环，180s 必腰斩
@@ -285,12 +286,16 @@ export async function consumeFullStream(
   fullStream: AsyncIterable<any>,
   initialMsg: ReturnType<ResTool["newMessage"]>,
   syncMsg?: () => ReturnType<ResTool["newMessage"]>,
+  /** HP2 半截稿抢救：周期回调（每 +2000 字或 60s），消费方据此把流式中间稿落 crash 快照 */
+  opts?: { onCheckpoint?: (text: string) => void },
 ): Promise<string> {
   let msg = initialMsg;
   let text = msg.text();
   let thinking: ReturnType<typeof msg.thinking> | null = null;
   let thinkTime = 0;
   let fullResponse = "";
+  let cpLen = 0;
+  let cpAt = Date.now();
 
   try {
     for await (const chunk of fullStream) {
@@ -314,6 +319,16 @@ export async function consumeFullStream(
       } else if (chunk.type === "text-delta") {
         text.append(chunk.text);
         fullResponse += chunk.text;
+        // HP2 半截稿 checkpoint 触发：+2000 字或 60s 有新增即回调（异常由消费方自行吞）
+        if (opts?.onCheckpoint && (fullResponse.length - cpLen >= 2000 || (Date.now() - cpAt >= 60_000 && fullResponse.length > cpLen))) {
+          cpLen = fullResponse.length;
+          cpAt = Date.now();
+          try {
+            opts.onCheckpoint(fullResponse);
+          } catch {
+            /* checkpoint 失败不影响流式消费 */
+          }
+        }
       } else if (chunk.type === "error") {
         throw chunk.error;
       }
@@ -476,15 +491,21 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
   function beginGenerationMeta(pid: number, stageKey: string | null): Promise<string> {
     const attemptId = `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     // 合并写（不整体替换）：wordRetry/pendingReview 等持久键不能被运行位登记清掉
-    return queueGenerationMeta(pid, (gen) => ({ ...gen, running: true, startedAt: Date.now(), stageKey, endedAt: null, attemptId })).then(() => attemptId);
+    return queueGenerationMeta(pid, (gen) => ({ ...gen, running: true, startedAt: Date.now(), stageKey, endedAt: null, attemptId })).then(() => {
+      appendAgentEvent({ projectId: pid, agentKey, eventType: "generation_begin", payload: { attemptId, stageKey } });
+      return attemptId;
+    });
   }
   /** 结束一次生成尝试（幂等防交错）：仅当运行位仍是自己的 attempt 才写收尾 */
   function endGenerationMeta(pid: number, attemptId: string): Promise<void> {
-    return queueGenerationMeta(pid, (gen) =>
-      typeof gen.attemptId === "string" && gen.attemptId !== attemptId
-        ? gen
-        : { ...gen, running: false, stageKey: (gen.stageKey as string | null) ?? null, endedAt: Date.now() },
-    ).then(() => undefined);
+    let applied = false;
+    return queueGenerationMeta(pid, (gen) => {
+      if (typeof gen.attemptId === "string" && gen.attemptId !== attemptId) return gen;
+      applied = true;
+      return { ...gen, running: false, stageKey: (gen.stageKey as string | null) ?? null, endedAt: Date.now() };
+    }).then(() => {
+      if (applied) appendAgentEvent({ projectId: pid, agentKey, eventType: "generation_end", payload: { attemptId } });
+    });
   }
 
   // ── R2 待复核裁决位（generation.pendingReview）：门禁强停挂起时的持久化快照，
@@ -1060,7 +1081,7 @@ export function createStageEngine({ agentKey, defs, registry, hooks }: StageEngi
           isFirst,
           isLast,
         });
-        const action = await waitForStageConfirm(ctx, stage.stageKey);
+        const action = await waitForStageConfirm({ ...ctx, projectId: Number(ctx.resTool.data.projectId) }, stage.stageKey);
         if (action === "abort") return { ok: false, error: "流程已中止（连接断开或被新指令接管）" };
         if (action === "redo") {
           // P1-5 针对性返工：socket 层备注转入状态机（planRedo 原子完成计数 + 登记），原地重跑本步
