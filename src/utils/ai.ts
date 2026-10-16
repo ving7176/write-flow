@@ -277,7 +277,7 @@ export function parseStructuredFallback<T>(text: string, xmlTag: string | undefi
 export type AiTaskRecord = (
   state: 1 | -1,
   reason?: string,
-  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number; cost?: number },
+  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number; cost?: number; promptHash?: string },
 ) => Promise<void>;
 
 /** SDK usage 归一化：AI SDK 各供应商 usage 字段一致（promptTokens/completionTokens/totalTokens），容错非数字值 */
@@ -432,20 +432,22 @@ class AiText {
         usedModel = modelName;
         return streamText((await this.buildTextOptions(input as Record<string, unknown>, modelName, { stream: true })) as Parameters<typeof streamText>[0]);
       });
-      this.logAiCall("ok", startMs, promptTag);
-      // streamText 的 usage 是 Promise，流被消费完才 resolve；失败/中断静默（不阻断主流程）
+      // CP4：stream 的 ok 日志移到流消费结束（usage resolve 时）——原记在流引用返回时，
+      // durationMs≈0/tokens 恒空（观测失真）；无 usagePromise 的形态保留立即 ok
+      const usagePromise = (res as { usage?: PromiseLike<unknown> }).usage;
       const tr = this.taskRecord;
-      if (tr) {
-        const usagePromise = (res as { usage?: PromiseLike<unknown> }).usage;
-        if (usagePromise) {
-          Promise.resolve(usagePromise)
-            .then((rawUsage) => {
-              const usage = toTokenUsage(rawUsage);
-              const cost = settleCost(usedModel, usage);
-              return tr(1, undefined, { ...usage, ...(cost != null ? { cost } : {}), ...promptTag });
-            })
-            .catch(() => {});
-        }
+      if (usagePromise) {
+        Promise.resolve(usagePromise)
+          .then((rawUsage) => {
+            const usage = toTokenUsage(rawUsage);
+            const cost = settleCost(usedModel, usage);
+            this.logAiCall("ok", startMs, { ...promptTag, ...(usage?.totalTokens != null ? { tokens: usage.totalTokens } : {}), ...(cost != null ? { cost } : {}) });
+            if (tr) return tr(1, undefined, { ...usage, ...(cost != null ? { cost } : {}), ...promptTag });
+          })
+          .catch(() => {});
+      } else {
+        this.logAiCall("ok", startMs, promptTag);
+        if (tr) await tr(1, undefined, promptTag);
       }
       return res;
     } catch (e) {

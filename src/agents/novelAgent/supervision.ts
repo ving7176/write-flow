@@ -238,7 +238,9 @@ export function buildRepairPrompt(current: RepairChapterInput, hardIssues: Super
     ([type, items]) =>
       `### ${type}（${items.length} 处）\n${items.map((i) => `- [${type}] ${i.text}`).join("\n")}\n修正方式：${REPAIR_STRATEGY[type] ?? REPAIR_STRATEGY.OTHER}`,
   );
-  const wordHint = byType.has("WORD") ? `- 存在字数问题：修正稿正文字数**必须达到约 ${WORD_TARGET} 字**（不含标点空行的正文主体），交付前自行清点` : "";
+  // CP2（2026-10-15）：字数硬锚无条件注入——原仅 WORD 硬伤时提示，混合硬伤返工 prompt 无字数下限
+  // 且「篇幅与原文相近」会把短稿锚定回去（236 返工 B→C 劣化实锤：越修越短）
+  const wordHint = `- 修正稿正文可见字数**必须 ≥${WORD_TARGET} 字**（不含标点空行的正文主体，交付前自行清点）——「篇幅与原文相近」仅在原稿已达标时适用，原稿不足 ${WORD_TARGET} 字时必须扩写到位`;
   return [
     `你上一稿章节存在以下问题，请**定点修正**（不是整章重写）：`,
     "",
@@ -250,7 +252,7 @@ export function buildRepairPrompt(current: RepairChapterInput, hardIssues: Super
     wordHint,
     "- 问题涉及金钱/物品/能力/知识来源时，必须交代合理的获取或习得途径，严禁凭空获得",
     "- 必须遵守本书已确立的硬约束（见工作区数据），修复后不得引入新的矛盾",
-    "- 输出**完整章节全文**（不是补丁），篇幅与原文相近",
+    "- 输出**完整章节全文**（不是补丁）",
   ].filter(Boolean).join("\n");
 }
 
@@ -334,6 +336,38 @@ export function buildWordContinuePrompt(current: RepairChapterInput, issues: Sup
     `（这里从第二行开始只写续写的新增正文，写足后按原计划收尾）</content></chapterItem>`,
     "【续】标记必须在 <content> 标签内第一行；标记后只有新增正文，不要重复已有内容，不要输出说明。",
   ].join("\n");
+}
+
+/**
+ * CP3 短稿补足公共出口（降级通道拒收前 / afterSubAgent 短稿早检共用）：
+ * 不足→【续】标记续写合并；超限→定点压缩全文；复验 scan 清零才返回补足稿，否则 null（调用方走拒收）。
+ * 一次补足 ≈1-2 分钟，远低于整章重跑（236 实证一轮 5-21 分钟）。
+ */
+export async function continueFixShortDraft(
+  stageTools: RepairStageTools,
+  chapter: RepairChapterInput,
+  wordMin: number,
+  scanProvider: (content: string) => ScanIssue[],
+): Promise<RepairChapterInput | null> {
+  const curVis = (chapter.content ?? "").replace(/\s+/g, "").length;
+  const isUnder = curVis < wordMin;
+  const resp = await stageTools.chapter.execute?.(
+    { prompt: buildWordContinuePrompt(chapter, [{ type: "WORD", text: `当前 ${curVis} 字（下限 ${wordMin}）` }]) },
+    { toolCallId: "stage-chapter-continue-fix", messages: [] },
+  );
+  const parsed = extractField(resp, "parsed") as RepairChapterInput | undefined;
+  const cont = (parsed?.content ?? "").trim();
+  if (!cont) return null;
+  let candidate: string | null = null;
+  if (isUnder) {
+    const merged = mergeWordContinue(chapter.content ?? "", cont);
+    if (merged.ok) candidate = merged.content;
+  } else {
+    candidate = cont; // 超限压缩分支输出全文
+  }
+  if (!candidate) return null;
+  const recheck = scanProvider(candidate.slice(0, 6000)).find((i) => i.type === "WORD" && i.hard);
+  return recheck ? null : { ...chapter, content: candidate };
 }
 
 /**

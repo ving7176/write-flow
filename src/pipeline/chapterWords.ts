@@ -60,4 +60,29 @@ export function checkChapterWords(rawText: string, opts: ChapterWordsOptions = {
   return { count, min, max, overLimit, message };
 }
 
+/**
+ * CP3 分拍字数配额表：把单一「约 3000」软锚换成逐拍结构化锚——模型对逐拍配额的遵循
+ * 远好于全局数字（短稿根治 · 236/239 连续短稿取证后的内容侧杠杆）。
+ * 节拍数按章卡 summary 的加粗小标题计数（markdown 加粗小标题，如 节拍一/喘点）；无结构（<2 拍）给单段配额。
+ */
+export function buildBeatQuotaBlock(cardSummary: string, wordMin: number, wordMax: number): string {
+  const beats = (cardSummary ?? "").match(/\*\*[^*\n]{1,20}\*\*/g) ?? [];
+  const n = beats.length;
+  const mid = Math.round((wordMin + wordMax) / 2);
+  if (n < 2) {
+    return [
+      "【本章字数配额（硬性）】",
+      `- 全文可见字数 ${wordMin}~${wordMax} 字，目标 ${mid} 字左右，交付前自行清点`,
+    ].join("\n");
+  }
+  const per = Math.round(mid / n);
+  const lines = [
+    "【本章字数配额（硬性，逐拍清点）】",
+    `- 共 ${n} 拍，每拍约 ${per} 字（±80），全部拍合计须落在 ${wordMin}~${wordMax} 字`,
+    ...beats.map((b, i) => `  - ${b} → 约 ${i === n - 1 ? mid - per * (n - 1) : per} 字${i === n - 1 ? "（含章尾钩子）" : ""}`),
+    "- 任一拍明显偏短即整章不达标：写不满就展开对话回合与动作细节，禁止概括带过",
+  ];
+  return lines.join("\n");
+}
+
 export default checkChapterWords;
